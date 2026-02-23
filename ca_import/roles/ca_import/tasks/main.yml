@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+# ---------------------------------------------------------------------------
+# ca_import — main tasks
+# Installs or removes a CA certificate across multiple trust stores.
+# ---------------------------------------------------------------------------
+
+- name: ca_import | validate configuration
+  ansible.builtin.assert:
+    that:
+      - ca_import_fetch_url != "" or ca_import_local_path != "" or ca_import_pem_content != ""
+    fail_msg: >
+      At least one of ca_import_fetch_url, ca_import_local_path, or
+      ca_import_pem_content must be set.
+  tags: [ca_import, always]
+
+# ---------------------------------------------------------------------------
+# Gather the CA certificate
+# ---------------------------------------------------------------------------
+
+- name: ca_import | fetch CA cert from PKI server
+  ansible.builtin.get_url:
+    url: "{{ ca_import_fetch_url }}"
+    dest: "/tmp/{{ ca_import_name }}.pem"
+    timeout: "{{ ca_import_fetch_timeout }}"
+    validate_certs: false   # bootstrapping — we don't yet trust this CA
+    mode: "0644"
+  when: ca_import_fetch_url != ""
+  tags: [ca_import]
+
+- name: ca_import | copy CA cert from controller
+  ansible.builtin.copy:
+    src: "{{ ca_import_local_path }}"
+    dest: "/tmp/{{ ca_import_name }}.pem"
+    mode: "0644"
+  when: ca_import_local_path != "" and ca_import_fetch_url == ""
+  tags: [ca_import]
+
+- name: ca_import | write inline PEM content
+  ansible.builtin.copy:
+    content: "{{ ca_import_pem_content }}"
+    dest: "/tmp/{{ ca_import_name }}.pem"
+    mode: "0644"
+  when: ca_import_pem_content != "" and ca_import_fetch_url == "" and ca_import_local_path == ""
+  tags: [ca_import]
+
+- name: ca_import | slurp cert for validation and reuse
+  ansible.builtin.slurp:
+    src: "/tmp/{{ ca_import_name }}.pem"
+  register: _ca_cert_slurp
+  tags: [ca_import]
+
+- name: ca_import | validate PEM contains a certificate
+  ansible.builtin.assert:
+    that:
+      - "'BEGIN CERTIFICATE' in (_ca_cert_slurp.content | b64decode)"
+    fail_msg: "Fetched content does not appear to be a valid PEM certificate."
+  when: ca_import_validate
+  tags: [ca_import]
+
+# ---------------------------------------------------------------------------
+# OS-specific system trust store
+# ---------------------------------------------------------------------------
+
+- name: ca_import | include OS-specific tasks
+  ansible.builtin.include_tasks: "{{ item }}"
+  with_first_found:
+    - files:
+        - "system_{{ ansible_distribution | lower }}_{{ ansible_distribution_major_version }}.yml"
+        - "system_{{ ansible_distribution | lower }}.yml"
+        - "system_{{ ansible_os_family | lower }}.yml"
+        - "system_darwin.yml"
+        - "system_unsupported.yml"
+  when: ca_import_system
+  tags: [ca_import, system]
+
+# ---------------------------------------------------------------------------
+# Optional: Java cacerts
+# ---------------------------------------------------------------------------
+
+- name: ca_import | Java trust store
+  ansible.builtin.include_tasks: java.yml
+  when: ca_import_java
+  tags: [ca_import, java]
+
+# ---------------------------------------------------------------------------
+# Optional: Python certifi
+# ---------------------------------------------------------------------------
+
+- name: ca_import | Python certifi bundle
+  ansible.builtin.include_tasks: python.yml
+  when: ca_import_python
+  tags: [ca_import, python]
+
+# ---------------------------------------------------------------------------
+# Optional: curl / libcurl
+# ---------------------------------------------------------------------------
+
+- name: ca_import | curl CA bundle
+  ansible.builtin.include_tasks: curl.yml
+  when: ca_import_curl
+  tags: [ca_import, curl]
+
+# ---------------------------------------------------------------------------
+# Optional: Mozilla NSS (Firefox / Chromium)
+# ---------------------------------------------------------------------------
+
+- name: ca_import | NSS database
+  ansible.builtin.include_tasks: nss.yml
+  when: ca_import_nss
+  tags: [ca_import, nss]
+
+# ---------------------------------------------------------------------------
+# Clean up temp file
+# ---------------------------------------------------------------------------
+
+- name: ca_import | remove temp PEM file
+  ansible.builtin.file:
+    path: "/tmp/{{ ca_import_name }}.pem"
+    state: absent
+  tags: [ca_import, always]

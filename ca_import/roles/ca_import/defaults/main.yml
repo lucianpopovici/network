@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+# ---------------------------------------------------------------------------
+# CA source — exactly one of these must be set
+# ---------------------------------------------------------------------------
+
+# Fetch the CA cert directly from the PKI server (recommended)
+# Example: "http://pki.internal:8080/ca/cert.pem"
+ca_import_fetch_url: ""
+
+# Or supply a local path on the Ansible controller (will be copied to targets)
+# Example: "/etc/pki/internal/ca.crt"
+ca_import_local_path: ""
+
+# Or provide the PEM content inline (useful in CI/CD pipelines)
+# Example: |
+#   -----BEGIN CERTIFICATE-----
+#   MIIBxTCCAW...
+#   -----END CERTIFICATE-----
+ca_import_pem_content: ""
+
+# ---------------------------------------------------------------------------
+# Identity
+# ---------------------------------------------------------------------------
+
+# Filename used in the system trust store (without extension on Linux)
+ca_import_name: "pypki-ca"
+
+# Human-readable label (used in some stores, e.g. NSS, macOS Keychain)
+ca_import_label: "PyPKI Internal CA"
+
+# ---------------------------------------------------------------------------
+# Trust store targets
+# ---------------------------------------------------------------------------
+
+# System-wide trust store (update-ca-certificates / update-ca-trust)
+ca_import_system: true
+
+# Java cacerts (via keytool) — set java_home if not auto-detected
+ca_import_java: false
+ca_import_java_home: ""          # e.g. /usr/lib/jvm/java-17-openjdk-amd64
+ca_import_java_storepass: "changeit"
+
+# Python certifi bundle (pip install certifi must already be done)
+ca_import_python: false
+# Specific Python binary to find the certifi bundle; empty = system python3
+ca_import_python_bin: "python3"
+
+# curl / libcurl (via CURL_CA_BUNDLE env var in /etc/environment)
+ca_import_curl: false
+
+# Mozilla NSS (used by Firefox, Chromium, etc.) via certutil
+ca_import_nss: false
+
+# macOS System Keychain (runs security add-trusted-cert)
+# Only effective on macOS hosts — safely skipped on Linux
+ca_import_macos_keychain: true
+
+# ---------------------------------------------------------------------------
+# Behaviour
+# ---------------------------------------------------------------------------
+
+# Validate the fetched cert is a valid PEM CA before installing
+ca_import_validate: true
+
+# Remove (deregister) the CA instead of adding it
+ca_import_remove: false
+
+# Timeout in seconds when fetching the cert from the PKI server
+ca_import_fetch_timeout: 30

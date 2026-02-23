@@ -1,0 +1,109 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+# curl — set CURL_CA_BUNDLE in /etc/environment so all processes inherit it
+# Also creates a merged bundle at /etc/ssl/certs/pypki-bundle.pem
+
+- name: ca_import | curl | ensure /etc/ssl/certs exists
+  ansible.builtin.file:
+    path: /etc/ssl/certs
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: ca_import | curl | find system CA bundle
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: _system_bundle_check
+  loop:
+    - /etc/ssl/certs/ca-certificates.crt      # Debian/Ubuntu
+    - /etc/pki/tls/certs/ca-bundle.crt         # RedHat
+    - /etc/ssl/ca-bundle.pem                   # SUSE
+    - /etc/ssl/cert.pem                        # macOS/Alpine
+
+- name: ca_import | curl | set system bundle path
+  ansible.builtin.set_fact:
+    _system_ca_bundle: >-
+      {{
+        (_system_bundle_check.results
+         | selectattr('stat.exists', 'equalto', true)
+         | map(attribute='item')
+         | list
+         | first)
+      }}
+  failed_when: _system_ca_bundle is not defined
+
+- name: ca_import | curl | slurp system bundle
+  ansible.builtin.slurp:
+    src: "{{ _system_ca_bundle }}"
+  register: _system_bundle_content
+
+- name: ca_import | curl | slurp new CA
+  ansible.builtin.slurp:
+    src: "/tmp/{{ ca_import_name }}.pem"
+  register: _curl_ca_pem
+
+- name: ca_import | curl | build merged bundle (install)
+  ansible.builtin.copy:
+    content: >-
+      {{ _system_bundle_content.content | b64decode }}
+      {{ _curl_ca_pem.content | b64decode }}
+    dest: /etc/ssl/certs/pypki-bundle.pem
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  when: not ca_import_remove
+
+- name: ca_import | curl | restore system bundle (remove)
+  ansible.builtin.copy:
+    content: "{{ _system_bundle_content.content | b64decode }}"
+    dest: /etc/ssl/certs/pypki-bundle.pem
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  when: ca_import_remove
+
+- name: ca_import | curl | set CURL_CA_BUNDLE in /etc/environment (install)
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: '^CURL_CA_BUNDLE='
+    line: 'CURL_CA_BUNDLE=/etc/ssl/certs/pypki-bundle.pem'
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  when: not ca_import_remove
+
+- name: ca_import | curl | remove CURL_CA_BUNDLE from /etc/environment (remove)
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: '^CURL_CA_BUNDLE='
+    state: absent
+  become: true
+  when: ca_import_remove
+
+- name: ca_import | curl | set SSL_CERT_FILE for OpenSSL-linked tools (install)
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: '^SSL_CERT_FILE='
+    line: 'SSL_CERT_FILE=/etc/ssl/certs/pypki-bundle.pem'
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  when: not ca_import_remove
+
+- name: ca_import | curl | remove SSL_CERT_FILE (remove)
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: '^SSL_CERT_FILE='
+    state: absent
+  become: true
+  when: ca_import_remove

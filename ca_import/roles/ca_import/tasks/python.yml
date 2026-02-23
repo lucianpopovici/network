@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+# Python — append CA to certifi's cacert.pem bundle
+
+- name: ca_import | python | find certifi bundle path
+  ansible.builtin.command:
+    cmd: "{{ ca_import_python_bin }} -c \"import certifi; print(certifi.where())\""
+  register: _certifi_path
+  changed_when: false
+  failed_when: _certifi_path.rc != 0
+
+- name: ca_import | python | slurp existing certifi bundle
+  ansible.builtin.slurp:
+    src: "{{ _certifi_path.stdout | trim }}"
+  register: _certifi_bundle
+
+- name: ca_import | python | slurp new CA cert
+  ansible.builtin.slurp:
+    src: "/tmp/{{ ca_import_name }}.pem"
+  register: _new_ca_pem
+
+- name: ca_import | python | check if CA already in certifi bundle
+  ansible.builtin.set_fact:
+    _certifi_has_ca: >-
+      {{
+        (_new_ca_pem.content | b64decode | trim)
+        in (_certifi_bundle.content | b64decode)
+      }}
+
+- name: ca_import | python | append CA to certifi bundle
+  ansible.builtin.blockinfile:
+    path: "{{ _certifi_path.stdout | trim }}"
+    block: "{{ _new_ca_pem.content | b64decode }}"
+    marker: "# {mark} PYPKI CA: {{ ca_import_name }}"
+    insertafter: EOF
+  become: true
+  when:
+    - not ca_import_remove
+    - not _certifi_has_ca
+
+- name: ca_import | python | remove CA from certifi bundle
+  ansible.builtin.blockinfile:
+    path: "{{ _certifi_path.stdout | trim }}"
+    block: "{{ _new_ca_pem.content | b64decode }}"
+    marker: "# {mark} PYPKI CA: {{ ca_import_name }}"
+    state: absent
+  become: true
+  when: ca_import_remove

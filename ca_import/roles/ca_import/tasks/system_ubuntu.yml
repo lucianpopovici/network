@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+# Ubuntu uses the same mechanism as Debian
+- name: ca_import | system | include Debian tasks for Ubuntu
+  ansible.builtin.include_tasks: system_debian.yml

@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+# Mozilla NSS — certutil import for Firefox, Chromium, and system NSS databases
+# Requires nss-tools (RHEL) or libnss3-tools (Debian) to be installed
+
+- name: ca_import | nss | install certutil (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: libnss3-tools
+    state: present
+  become: true
+  when: ansible_os_family == "Debian"
+
+- name: ca_import | nss | install certutil (RedHat)
+  ansible.builtin.package:
+    name: nss-tools
+    state: present
+  become: true
+  when: ansible_os_family == "RedHat"
+
+- name: ca_import | nss | find all NSS databases on the system
+  ansible.builtin.find:
+    paths:
+      - /root
+      - /home
+      - /etc/pki/nssdb
+    patterns:
+      - "cert9.db"    # SQLite NSS (modern)
+      - "cert8.db"    # Legacy Berkeley DB NSS
+    recurse: true
+    hidden: true
+  register: _nss_dbs
+  become: true
+
+- name: ca_import | nss | build list of NSS database directories
+  ansible.builtin.set_fact:
+    _nss_db_dirs: >-
+      {{
+        _nss_dbs.files
+        | map(attribute='path')
+        | map('dirname')
+        | unique
+        | list
+      }}
+
+- name: ca_import | nss | add CA to each NSS database (install)
+  ansible.builtin.command:
+    cmd: >
+      certutil -A
+      -d "sql:{{ item }}"
+      -n "{{ ca_import_label }}"
+      -t "CT,,"
+      -i /tmp/{{ ca_import_name }}.pem
+  loop: "{{ _nss_db_dirs }}"
+  become: true
+  when: not ca_import_remove
+  changed_when: true
+  failed_when: false   # some user DBs may be locked; best-effort
+
+- name: ca_import | nss | remove CA from each NSS database (remove)
+  ansible.builtin.command:
+    cmd: >
+      certutil -D
+      -d "sql:{{ item }}"
+      -n "{{ ca_import_label }}"
+  loop: "{{ _nss_db_dirs }}"
+  become: true
+  when: ca_import_remove
+  changed_when: true
+  failed_when: false
+
+- name: ca_import | nss | also handle system NSS database (/etc/pki/nssdb)
+  ansible.builtin.command:
+    cmd: >
+      certutil {{ '-A -t "CT,,"' if not ca_import_remove else '-D' }}
+      -d sql:/etc/pki/nssdb
+      -n "{{ ca_import_label }}"
+      {{ '-i /tmp/' + ca_import_name + '.pem' if not ca_import_remove else '' }}
+  become: true
+  changed_when: true
+  failed_when: false
+  when: ansible_os_family == "RedHat"

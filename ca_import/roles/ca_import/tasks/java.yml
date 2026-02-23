@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+# Java — keytool import into cacerts
+
+- name: ca_import | java | auto-detect JAVA_HOME
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      java -XshowSettings:all -version 2>&1 \
+        | grep 'java.home' \
+        | awk '{print $NF}'
+    executable: /bin/bash
+  register: _java_home_detected
+  changed_when: false
+  failed_when: false
+  when: ca_import_java_home == ""
+
+- name: ca_import | java | set effective JAVA_HOME
+  ansible.builtin.set_fact:
+    _ca_import_java_home: >-
+      {{
+        ca_import_java_home
+        if ca_import_java_home != ""
+        else _java_home_detected.stdout | trim
+      }}
+
+- name: ca_import | java | fail if JAVA_HOME not found
+  ansible.builtin.fail:
+    msg: >
+      Could not detect JAVA_HOME. Set ca_import_java_home explicitly.
+  when: _ca_import_java_home == ""
+
+- name: ca_import | java | locate cacerts
+  ansible.builtin.set_fact:
+    _ca_import_cacerts: "{{ _ca_import_java_home }}/lib/security/cacerts"
+
+- name: ca_import | java | check if alias already exists
+  ansible.builtin.command:
+    cmd: >
+      keytool -list
+      -alias "{{ ca_import_name }}"
+      -keystore "{{ _ca_import_cacerts }}"
+      -storepass "{{ ca_import_java_storepass }}"
+      -noprompt
+  register: _java_alias_check
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: ca_import | java | import CA into cacerts
+  ansible.builtin.command:
+    cmd: >
+      keytool -importcert
+      -alias "{{ ca_import_name }}"
+      -file /tmp/{{ ca_import_name }}.pem
+      -keystore "{{ _ca_import_cacerts }}"
+      -storepass "{{ ca_import_java_storepass }}"
+      -noprompt
+      -trustcacerts
+  become: true
+  when:
+    - not ca_import_remove
+    - _java_alias_check.rc != 0
+
+- name: ca_import | java | remove CA from cacerts
+  ansible.builtin.command:
+    cmd: >
+      keytool -delete
+      -alias "{{ ca_import_name }}"
+      -keystore "{{ _ca_import_cacerts }}"
+      -storepass "{{ ca_import_java_storepass }}"
+      -noprompt
+  become: true
+  when:
+    - ca_import_remove
+    - _java_alias_check.rc == 0

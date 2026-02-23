@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+- name: ca_import | update-ca-certificates
+  ansible.builtin.command:
+    cmd: update-ca-certificates
+  become: true
+  listen: "ca_import | update-ca-certificates"
+
+- name: ca_import | update-ca-trust
+  ansible.builtin.command:
+    cmd: update-ca-trust extract
+  become: true
+  listen: "ca_import | update-ca-trust"

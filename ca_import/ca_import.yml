@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+# =============================================================================
+# ca_import.yml — Import PyPKI CA certificate into client machine trust stores
+# =============================================================================
+#
+# Usage:
+#   ansible-playbook ca_import.yml -i inventory/hosts.yml
+#
+# Override variables at the CLI:
+#   ansible-playbook ca_import.yml -i inventory/hosts.yml \
+#     -e ca_import_fetch_url=http://pki.internal:8080/ca/cert.pem \
+#     -e ca_import_java=true \
+#     -e ca_import_python=true
+#
+# Run only against specific groups:
+#   ansible-playbook ca_import.yml -i inventory/hosts.yml --limit java_servers
+#
+# Remove the CA (deregister from all stores):
+#   ansible-playbook ca_import.yml -i inventory/hosts.yml -e ca_import_remove=true
+#
+# Tags:
+#   system   — OS trust store only
+#   java     — Java cacerts only
+#   python   — Python certifi only
+#   curl     — curl/libcurl bundle only
+#   nss      — Mozilla NSS databases only
+#   verify   — run verification script only (no install)
+#
+# Example (install system + Java, then verify):
+#   ansible-playbook ca_import.yml -i inventory/hosts.yml \
+#     --tags system,java,verify
+# =============================================================================
+
+- name: Import PyPKI CA into client trust stores
+  hosts: all
+  gather_facts: true
+  become: false   # individual tasks escalate via become: true as needed
+
+  vars:
+    # -----------------------------------------------------------------------
+    # Override these in inventory group_vars, host_vars, or -e on the CLI
+    # -----------------------------------------------------------------------
+
+    # Source of the CA certificate — pick ONE:
+    ca_import_fetch_url: "http://pki.internal:8080/ca/cert.pem"
+    # ca_import_local_path: "/path/on/controller/ca.crt"
+    # ca_import_pem_content: |
+    #   -----BEGIN CERTIFICATE-----
+    #   ...
+    #   -----END CERTIFICATE-----
+
+    # Identity
+    ca_import_name:  "pypki-ca"
+    ca_import_label: "PyPKI Internal CA"
+
+    # Trust stores to update — flip to true as needed
+    ca_import_system:  true
+    ca_import_java:    false
+    ca_import_python:  false
+    ca_import_curl:    false
+    ca_import_nss:     false
+
+    # Java-specific (only used if ca_import_java: true)
+    ca_import_java_home:      ""          # auto-detected if empty
+    ca_import_java_storepass: "changeit"
+
+    # Python-specific (only used if ca_import_python: true)
+    ca_import_python_bin: "python3"
+
+    # Behaviour
+    ca_import_validate:      true
+    ca_import_remove:        false
+    ca_import_fetch_timeout: 30
+
+  roles:
+    - role: ca_import
+
+  post_tasks:
+    - name: Deploy verification script
+      ansible.builtin.template:
+        src: "roles/ca_import/templates/verify_ca_trust.sh.j2"
+        dest: "/tmp/verify_ca_trust.sh"
+        mode: "0755"
+      tags: [verify, ca_import]
+
+    - name: Run verification script
+      ansible.builtin.command:
+        cmd: /tmp/verify_ca_trust.sh
+      register: _verify_result
+      changed_when: false
+      failed_when: _verify_result.rc != 0
+      tags: [verify, ca_import]
+
+    - name: Show verification output
+      ansible.builtin.debug:
+        var: _verify_result.stdout_lines
+      tags: [verify, ca_import]
+
+    - name: Remove verification script
+      ansible.builtin.file:
+        path: /tmp/verify_ca_trust.sh
+        state: absent
+      tags: [verify, ca_import]

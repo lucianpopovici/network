@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+# macOS — security add-trusted-cert into System Keychain
+
+- name: ca_import | system | check if CA is already trusted (macOS)
+  ansible.builtin.command:
+    cmd: >
+      security find-certificate
+      -c "{{ ca_import_label }}"
+      /Library/Keychains/System.keychain
+  register: _macos_cert_check
+  changed_when: false
+  failed_when: false
+  when: ansible_os_family == "Darwin"
+
+- name: ca_import | system | add CA to System Keychain (macOS)
+  ansible.builtin.command:
+    cmd: >
+      security add-trusted-cert
+      -d
+      -r trustRoot
+      -k /Library/Keychains/System.keychain
+      /tmp/{{ ca_import_name }}.pem
+  become: true
+  when:
+    - ansible_os_family == "Darwin"
+    - not ca_import_remove
+    - _macos_cert_check.rc != 0
+
+- name: ca_import | system | remove CA from System Keychain (macOS)
+  ansible.builtin.command:
+    cmd: >
+      security delete-certificate
+      -c "{{ ca_import_label }}"
+      /Library/Keychains/System.keychain
+  become: true
+  when:
+    - ansible_os_family == "Darwin"
+    - ca_import_remove
+    - _macos_cert_check.rc == 0
+  failed_when: false

@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+# Debian / Ubuntu — update-ca-certificates
+# CA certs live in /usr/local/share/ca-certificates/*.crt
+
+- name: ca_import | system | ensure ca-certificates package is installed (Debian)
+  ansible.builtin.apt:
+    name: ca-certificates
+    state: present
+    update_cache: true
+  become: true
+
+- name: ca_import | system | install CA cert (Debian)
+  ansible.builtin.copy:
+    src: "/tmp/{{ ca_import_name }}.pem"
+    dest: "/usr/local/share/ca-certificates/{{ ca_import_name }}.crt"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  when: not ca_import_remove
+  notify: ca_import | update-ca-certificates
+
+- name: ca_import | system | remove CA cert (Debian)
+  ansible.builtin.file:
+    path: "/usr/local/share/ca-certificates/{{ ca_import_name }}.crt"
+    state: absent
+  become: true
+  when: ca_import_remove
+  notify: ca_import | update-ca-certificates

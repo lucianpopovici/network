@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+galaxy_info:
+  role_name: ca_import
+  author: PyPKI
+  description: >
+    Install a custom CA certificate into the system trust store and
+    optionally into application-specific stores (Java, Python, curl, Firefox NSS).
+  license: MIT
+  min_ansible_version: "2.12"
+  platforms:
+    - name: Ubuntu
+      versions: [focal, jammy, noble]
+    - name: Debian
+      versions: [bullseye, bookworm]
+    - name: EL
+      versions: ["8", "9"]
+    - name: Fedora
+      versions: [38, 39, 40]
+    - name: MacOSX
+      versions: [all]
+
+dependencies: []

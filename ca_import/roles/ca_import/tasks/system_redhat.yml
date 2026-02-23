@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+# RedHat family — update-ca-trust
+# CA certs live in /etc/pki/ca-trust/source/anchors/
+
+- name: ca_import | system | ensure ca-certificates package is installed (RedHat)
+  ansible.builtin.package:
+    name: ca-certificates
+    state: present
+  become: true
+
+- name: ca_import | system | install CA cert (RedHat)
+  ansible.builtin.copy:
+    src: "/tmp/{{ ca_import_name }}.pem"
+    dest: "/etc/pki/ca-trust/source/anchors/{{ ca_import_name }}.pem"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  when: not ca_import_remove
+  notify: ca_import | update-ca-trust
+
+- name: ca_import | system | remove CA cert (RedHat)
+  ansible.builtin.file:
+    path: "/etc/pki/ca-trust/source/anchors/{{ ca_import_name }}.pem"
+    state: absent
+  become: true
+  when: ca_import_remove
+  notify: ca_import | update-ca-trust

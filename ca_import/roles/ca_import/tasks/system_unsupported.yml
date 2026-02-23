@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 PyPKI Contributors
+# MIT License — see LICENSE file in the root of this repository
+---
+- name: ca_import | system | unsupported OS warning
+  ansible.builtin.debug:
+    msg: >
+      System trust store import is not supported for
+      {{ ansible_distribution }} {{ ansible_distribution_version }}.
+      Supported families: Debian, RedHat, Darwin.
+      Set ca_import_system: false to suppress this warning.
