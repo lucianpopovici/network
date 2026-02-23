@@ -11,6 +11,106 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.5.0] — 2026-02-23
+
+### Added — CMPv3 (RFC 9480) + EST (RFC 7030)
+
+#### CMPv3 — RFC 9480 CMP Updates (`pki_cmpv2_server.py`)
+
+- **`pvno` version negotiation** — new `CMPv3Handler` class (extends `CMPv2Handler`);
+  reads `pvno` from the incoming PKIHeader and mirrors it back — clients sending
+  `pvno=3` (cmp2021) receive `pvno=3` in all responses; CMPv2 clients are unaffected
+- **`build_pki_message()` `pvno` parameter** — the DER builder now accepts an
+  explicit `pvno` argument (default `2`) so every response path can propagate the
+  negotiated version without breaking existing callers
+- **New `genm` info types (RFC 9480 §4.3)**:
+  - `id-it 17` `GetCACerts` — returns all CA certificates as a `CACertSeq` SEQUENCE
+  - `id-it 18` `GetRootCACertUpdate` — returns `RootCaKeyUpdateContent` with
+    `newWithNew` (current CA cert); `newWithOld`/`oldWithNew` omitted (no rollover)
+  - `id-it 19` `GetCertReqTemplate` — returns `CertReqTemplateContent` with an RSA
+    key-type hint and suggested extensions (SAN, EKU)
+  - `id-it 21/22` `CRLStatusList` / `CRLUpdateRetrieve` — returns the current CRL
+    built from the revocation database
+  - Unknown OIDs fall back to the original CMPv2 `id-it-caProtEncCert` response
+- **Extended polling — `pollReq` / `pollRep` (RFC 9480 §3.4)** — RFC 4210 only
+  defined polling for `ir`/`cr`/`kur`; RFC 9480 extends it to `p10cr`, `certConf`,
+  `rr`, `genm`, and `error` messages; implemented via an in-memory polling table
+  (`_polling_table`) with `queue_for_polling()` API; `pollRep` includes
+  `checkAfter` countdown so the client knows when to retry
+- **Client `error` message handling** — RFC 9480 allows clients to send error
+  messages; server now acknowledges with `pkiconf` instead of returning an
+  unhandled-body-type error
+- **Well-known URI paths (RFC 9480 / RFC 9811)**:
+  - `POST /.well-known/cmp` — standard CMP-over-HTTP endpoint; body is plain
+    PKIMessage DER (same as `POST /`)
+  - `POST /.well-known/cmp/p/<label>` — named CA variant; label extracted and
+    logged (future: multi-CA routing)
+  - `GET  /.well-known/cmp` — returns CA certificate PEM (service discovery)
+  - `GET  /.well-known/cmp/p/<label>` — same with optional `X-CMP-CA-Label` header
+- **`CMPv3Handler` selected by default** — `main()` instantiates `CMPv3Handler`
+  unless `--no-cmpv3` is passed; existing CMPv2 clients work transparently
+- **New CLI flags**:
+  - `--cmpv3` (default on) — enable CMPv3 handler
+  - `--no-cmpv3` — force CMPv2-only behaviour
+- **`OID_IT_*` constants** defined at module level for all RFC 9480 genm types
+- **`CMP_WELL_KNOWN_PATH`** constant (`/.well-known/cmp`) used in both `do_GET`
+  and `do_POST` routing
+
+#### EST — RFC 7030 Enrollment over Secure Transport (`est_server.py`)
+
+- New standalone module following the same pattern as `acme_server.py` and
+  `scep_server.py` — shares `CertificateAuthority`, runs standalone or integrated
+  via `--est-port`
+- **Supported operations (all RFC 7030 MUST + OPTIONAL)**:
+  - `GET  /.well-known/est/cacerts` — returns CA chain as base64-encoded PKCS#7
+    certs-only SignedData (`application/pkcs7-mime; smime-type=certs-only`)
+  - `POST /.well-known/est/simpleenroll` — accepts base64 DER PKCS#10 CSR,
+    returns signed certificate chain as PKCS#7
+  - `POST /.well-known/est/simplereenroll` — renewal; requires TLS client cert
+    for authentication (RFC 7030 §4.2.2); subject from existing cert accepted
+  - `GET  /.well-known/est/csrattrs` — returns `CsrAttrs` DER (RFC 7030 §4.5)
+    hinting RSA key type + SAN + EKU clientAuth extensions
+  - `POST /.well-known/est/serverkeygen` — server generates RSA-2048 key pair,
+    issues cert, returns `multipart/mixed` with PKCS#7 cert and PKCS#8 private
+    key (unencrypted; transport security provided by TLS)
+  - All endpoints also accept `/.well-known/est/<label>/<op>` for named CA label
+    routing (RFC 7030 §3.2.2)
+- **Authentication — both methods active simultaneously**:
+  - **HTTP Basic auth** — username:password checked against `ESTUserStore`;
+    passwords stored as SHA-256 hex hashes; compared with `hashlib.compare_digest`
+    to prevent timing attacks; `401 + WWW-Authenticate: Basic realm="EST"` on failure
+  - **TLS client certificate** — `ssl.CERT_OPTIONAL`; certificate verified against
+    CA by Authority Key Identifier (SKI match) or issuer name fallback; accepted
+    cert object passed to handler for subject logging and reenroll validation
+  - Either method satisfies `require_auth`; anonymous access allowed when
+    `require_auth=False` (default for open internal CAs)
+- **CSR decoding** — accepts base64 DER (RFC 7030 canonical), raw DER, or PEM
+  (fallback) so real-world clients that deviate from the spec still work
+- **EST HTTPS auto-TLS** — EST always runs over TLS (RFC 7030 §3); if no
+  `--est-tls-cert`/`--est-tls-key` supplied, a server cert is auto-issued from
+  the CA via `provision_tls_server_cert()`; `ssl.CERT_OPTIONAL` set so client
+  cert auth works without breaking non-mTLS clients
+- **`ESTCMSBuilder`** — pure-Python PKCS#7 certs-only SignedData builder (degenerate,
+  no signers) used for `cacerts`, `simpleenroll`, and `simplereenroll` responses
+- **`build_csrattrs()`** — builds RFC 7030 §4.5.2 `CsrAttrs` DER with
+  `extensionRequest` attribute hinting SAN and EKU
+- **`ESTUserStore`** — thread-safe in-memory user registry; `add_user()`,
+  `authenticate()`, `has_users()`
+- **Integration into `pki_cmpv2_server.py`**:
+  - `est_server` imported at startup with `HAS_EST` guard
+  - EST server started in background daemon thread alongside ACME, SCEP, CMPv3
+  - New CLI argument group `EST options (RFC 7030)`:
+    - `--est-port PORT`
+    - `--est-user USER:PASS` (repeatable)
+    - `--est-require-auth`
+    - `--est-tls-cert PATH` / `--est-tls-key PATH`
+  - Banner updated with `Listening (EST)` and `CMP Well-Known` rows
+  - EST operations section added to banner
+  - EST quick-start hint printed on startup
+  - `est_srv.shutdown()` added to `KeyboardInterrupt` handler
+
+---
+
 ## [0.4.0] — 2026-02-23
 
 ### Added — SCEP protocol (RFC 8894)
@@ -256,26 +356,33 @@ v0.1.0   Initial release — CA + CMPv2 + mTLS
 v0.2.0   ACME (RFC 8555) + ALPN + key rollover + Ansible CA import role
 v0.3.0   certbot compatibility — 11 RFC 8555 compliance fixes
 v0.4.0   SCEP protocol (RFC 8894) + CRL generation + GetCert by serial
+v0.5.0   CMPv3 (RFC 9480) + EST (RFC 7030) + well-known CMP URI (RFC 9811)
 ```
 
 ```bash
 # Tag and push the new release
-git add scep_server.py pki_cmpv2_server.py CHANGELOG.md
-git commit -m "v0.4.0: SCEP protocol (RFC 8894)
+git add scep_server.py est_server.py pki_cmpv2_server.py CHANGELOG.md README.md
+git commit -m "v0.5.0: CMPv3 (RFC 9480) + EST (RFC 7030)
 
-- New scep_server.py: GetCACaps, GetCACert, PKCSReq, CertPoll, GetCert, GetCRL
-- Pure-Python CMS SignedData/EnvelopedData parser and builder
-- Challenge password auth + renewal-without-challenge
-- Integrated into pki_cmpv2_server.py via --scep-port / --scep-challenge
-- New CA methods: get_certificate_by_serial(), generate_crl_der()
-- URL routing for /scep, /cgi-bin/pkiclient.exe, /scep/pkiclient.exe"
+CMPv3:
+- CMPv3Handler: pvno=3 auto-negotiation, well-known URI (RFC 9811)
+- New genm types: GetCACerts, GetRootCACertUpdate, GetCertReqTemplate, CRLUpdate
+- Extended polling for all message types (pollReq/pollRep)
+- Client error message acknowledgement
+- --cmpv3 / --no-cmpv3 CLI flags
 
-git tag -a v0.4.0 -m "v0.4.0: SCEP protocol (RFC 8894)"
-git push && git push origin v0.4.0
+EST:
+- New est_server.py: cacerts, simpleenroll, simplereenroll, csrattrs, serverkeygen
+- HTTP Basic auth + TLS client cert auth (both active simultaneously)
+- Auto-TLS via CA auto-issue; ssl.CERT_OPTIONAL for mixed auth
+- Integrated via --est-port / --est-user / --est-require-auth"
+
+git tag -a v0.5.0 -m "v0.5.0: CMPv3 (RFC 9480) + EST (RFC 7030)"
+git push && git push origin v0.5.0
 
 # Create a GitHub Release
-gh release create v0.4.0 \
-  --title "v0.4.0 — SCEP protocol (RFC 8894)" \
+gh release create v0.5.0 \
+  --title "v0.5.0 — CMPv3 + EST" \
   --notes-file CHANGELOG.md
 
 # Or in the browser:

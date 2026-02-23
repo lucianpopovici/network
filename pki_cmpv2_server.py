@@ -107,6 +107,13 @@ try:
 except ImportError:
     HAS_SCEP = False
 
+# EST server module (optional — loaded if --est-port is specified)
+try:
+    import est_server as _est_module
+    HAS_EST = True
+except ImportError:
+    HAS_EST = False
+
 # ASN.1 imports for CMPv2 message parsing
 try:
     from pyasn1.type import univ, namedtype, tag, constraint, namedval, useful
@@ -441,8 +448,12 @@ class CMPv2ASN1:
         sender_nonce: bytes,
         recip_nonce: bytes = b"",
         status_code: int = 0,
+        pvno: int = 2,
     ) -> bytes:
-        """Build a minimal DER-encoded PKIMessage response."""
+        """Build a minimal DER-encoded PKIMessage response.
+
+        pvno=2 for CMPv2 (RFC 4210), pvno=3 for CMPv3 (RFC 9480).
+        """
 
         def seq(content: bytes) -> bytes:
             return b"\x30" + cls._encode_length(len(content)) + content
@@ -482,7 +493,7 @@ class CMPv2ASN1:
             return b"\x06" + cls._encode_length(len(encoded)) + encoded
 
         # Build PKIHeader
-        pvno = integer(2)
+        pvno_field = integer(pvno)
 
         # sender/recipient: use NULL GeneralName (directoryName with empty DN)
         sender = ctx(4, seq(b""), constructed=True)   # GeneralName [4] directoryName
@@ -496,7 +507,7 @@ class CMPv2ASN1:
         tid = ctx(4, octet_string(transaction_id), constructed=False)
         snonce = ctx(5, octet_string(sender_nonce), constructed=False)
 
-        header_content = pvno + sender + recipient + msg_time + prot_alg + tid + snonce
+        header_content = pvno_field + sender + recipient + msg_time + prot_alg + tid + snonce
         if recip_nonce:
             header_content += ctx(6, octet_string(recip_nonce), constructed=False)
 
@@ -1488,6 +1499,310 @@ class CMPv2Handler:
 
 
 # ---------------------------------------------------------------------------
+# CMPv3 Handler (RFC 9480 — CMP Updates)
+# ---------------------------------------------------------------------------
+
+# RFC 9480 / RFC 9483 OIDs for new genm info types
+OID_IT_GETCACERTS           = "1.3.6.1.5.5.7.4.17"   # id-it 17
+OID_IT_GETROOTCAUPDATE      = "1.3.6.1.5.5.7.4.18"   # id-it 18
+OID_IT_GETROOTCAUPDATE_RESP = "1.3.6.1.5.5.7.4.20"   # id-it 20  (RootCaKeyUpdateContent)
+OID_IT_GETCERTREQTEMPLATE   = "1.3.6.1.5.5.7.4.19"   # id-it 19
+OID_IT_CRLSTATUSLIST        = "1.3.6.1.5.5.7.4.21"   # id-it 21  (CRL update request)
+OID_IT_CRLUPDATERESP        = "1.3.6.1.5.5.7.4.22"   # id-it 22  (CRL update response)
+OID_IT_CAPROTENCERT         = "1.3.6.1.5.5.7.4.2"    # original id-it-caProtEncCert
+OID_IT_SIGNKEYPAIRTYPES     = "1.3.6.1.5.5.7.4.3"    # id-it-signKeyPairTypes
+OID_IT_ENCKEYPAIRTYPES      = "1.3.6.1.5.5.7.4.4"    # id-it-encKeyPairTypes
+OID_IT_PREFERREDSYMMALG     = "1.3.6.1.5.5.7.4.5"    # id-it-preferredSymmAlg
+OID_IT_CACERTS              = "1.3.6.1.5.5.7.4.17"
+
+# Well-known URI prefix (RFC 9480 / RFC 9811)
+CMP_WELL_KNOWN_PATH = "/.well-known/cmp"
+
+
+class CMPv3Handler(CMPv2Handler):
+    """
+    CMPv3 handler extending CMPv2Handler with RFC 9480 / RFC 9483 features:
+      - pvno=3 version negotiation
+      - Extended polling (pollReq/pollRep for all message types)
+      - New genm types: GetCACerts, GetRootCACertUpdate, GetCertReqTemplate,
+        CRLStatusList / CRLUpdateRetrieve
+      - Well-known URI path routing (/.well-known/cmp[/p/<label>])
+    """
+
+    PVNO_CMP2021 = 3   # CMPv3 version number per RFC 9480
+    PVNO_CMP2000 = 2   # CMPv2 version number per RFC 4210
+
+    # poll period in seconds when a request is queued for async processing
+    POLL_PERIOD = 5
+
+    def __init__(self, ca: "CertificateAuthority"):
+        super().__init__(ca)
+        # txid -> {"status": "waiting"|"ready"|"error", "response": bytes, "deadline": float}
+        self._polling_table: Dict[bytes, Dict] = {}
+        self._poll_lock = threading.Lock()
+
+    def handle(self, der_data: bytes) -> bytes:
+        """Override: detect pvno=3 and route to CMPv3-aware handling."""
+        try:
+            msg = CMPv2ASN1.parse_pki_message(der_data)
+            pvno = msg.get("header", {}).get("pvno", 2)
+            body_type = msg.get("body_type", "unknown")
+            header = msg.get("header", {})
+            txid = header.get("transactionID", os.urandom(16))
+            snonce = header.get("senderNonce", os.urandom(16))
+
+            # Echo back pvno=3 if client sent pvno=3
+            response_pvno = self.PVNO_CMP2021 if pvno == 3 else self.PVNO_CMP2000
+
+            logger.info(
+                f"CMPv3 request: body_type={body_type} pvno={pvno} "
+                f"txid={txid.hex() if txid else 'none'}"
+            )
+
+            # pollReq — check the polling table
+            if body_type == "pollReq":
+                return self._handle_poll_req(msg, txid, snonce, response_pvno)
+
+            # Route to appropriate handler
+            if body_type in ("ir", "cr"):
+                resp = self._handle_cert_request(msg, txid, snonce, body_type)
+            elif body_type == "kur":
+                resp = self._handle_key_update(msg, txid, snonce)
+            elif body_type == "rr":
+                resp = self._handle_revocation(msg, txid, snonce)
+            elif body_type == "certConf":
+                resp = self._handle_cert_confirm(msg, txid, snonce)
+            elif body_type == "genm":
+                resp = self._handle_genm_v3(msg, txid, snonce, response_pvno)
+            elif body_type == "p10cr":
+                resp = self._handle_p10cr(msg, txid, snonce)
+            elif body_type == "error":
+                # RFC 9480: client may send error — acknowledge it
+                logger.warning(f"Client sent error message txid={txid.hex()}")
+                body = CMPv2ASN1.build_pkiconf_body()
+                resp = CMPv2ASN1.build_pki_message(
+                    19, body, txid, os.urandom(16), snonce, pvno=response_pvno
+                )
+            else:
+                logger.warning(f"Unsupported body type: {body_type}")
+                resp = self._build_error_v3(
+                    txid, snonce, os.urandom(16), 2,
+                    f"Unsupported body type: {body_type}", response_pvno
+                )
+
+            return resp
+
+        except Exception as e:
+            logger.error(f"CMPv3 handler error: {e}\n{traceback.format_exc()}")
+            return self._build_error(
+                os.urandom(16), os.urandom(16), os.urandom(16),
+                2, f"Internal server error: {e}"
+            )
+
+    # ------------------------------------------------------------------
+    # Extended genm (RFC 9480 new info types)
+    # ------------------------------------------------------------------
+
+    def _handle_genm_v3(self, msg: dict, txid: bytes, snonce: bytes, pvno: int) -> bytes:
+        """
+        Handle General Message with RFC 9480 extended info types.
+        Falls back to CMPv2 CA cert response for unknown OIDs.
+        """
+        body_raw = msg.get("body_raw", b"")
+        req_oid = self._extract_genm_oid(body_raw)
+
+        logger.info(f"genm OID: {req_oid!r}")
+
+        def _build_genp(info_value_der: bytes) -> bytes:
+            def seq(c): return b"\x30" + CMPv2ASN1._encode_length(len(c)) + c
+            genp_body = seq(info_value_der)
+            return CMPv2ASN1.build_pki_message(
+                22, genp_body, txid, os.urandom(16), snonce, pvno=pvno
+            )
+
+        def _oid_bytes(dotted: str) -> bytes:
+            parts = list(map(int, dotted.split(".")))
+            enc = bytes([40 * parts[0] + parts[1]])
+            for p in parts[2:]:
+                if p == 0:
+                    enc += b"\x00"
+                else:
+                    buf = []
+                    while p:
+                        buf.append(p & 0x7F)
+                        p >>= 7
+                    buf.reverse()
+                    enc += bytes([(b | 0x80) if i < len(buf)-1 else b for i, b in enumerate(buf)])
+            return b"\x06" + CMPv2ASN1._encode_length(len(enc)) + enc
+
+        def _seq(c): return b"\x30" + CMPv2ASN1._encode_length(len(c)) + c
+        def _oct(v): return b"\x04" + CMPv2ASN1._encode_length(len(v)) + v
+
+        if req_oid == OID_IT_GETCACERTS:
+            # RFC 9480 §4.3.3 — GetCACerts: return all CA certs (we have one)
+            ca_der = self.ca.ca_cert_der
+            # CMCPublicationInfo / CACertSeq = SEQUENCE OF Certificate
+            ca_seq = _seq(ca_der)
+            info_val = _seq(_oid_bytes(OID_IT_GETCACERTS) + _seq(ca_seq))
+            logger.info("genm GetCACerts: returning CA certificate")
+            return _build_genp(info_val)
+
+        elif req_oid == OID_IT_GETROOTCAUPDATE:
+            # RFC 9480 §4.3.4 — GetRootCACertUpdate: return newWithNew
+            # We have no separate "next CA" so we return current cert as newWithNew.
+            # RootCaKeyUpdateContent ::= SEQUENCE { newWithNew Cert, [0] newWithOld OPTIONAL, [1] oldWithNew OPTIONAL }
+            ca_der = self.ca.ca_cert_der
+            root_update = _seq(ca_der)  # just newWithNew
+            info_val = _seq(_oid_bytes(OID_IT_GETCACERTS) + root_update)
+            logger.info("genm GetRootCACertUpdate: returning current CA cert as newWithNew")
+            return _build_genp(info_val)
+
+        elif req_oid == OID_IT_GETCERTREQTEMPLATE:
+            # RFC 9480 §4.3.5 — GetCertReqTemplate: return template hints
+            # CertReqTemplateContent ::= SEQUENCE {
+            #   certTemplate CertTemplate OPTIONAL,
+            #   keySpec Controls OPTIONAL
+            # }
+            # We return a minimal template indicating RSA-2048 is preferred.
+            def _int(v): return b"\x02\x01" + bytes([v])
+            def _ctx_impl(n, c): return bytes([0xA0 | n]) + CMPv2ASN1._encode_length(len(c)) + c
+
+            # OID for rsaEncryption key type
+            rsa_oid = _oid_bytes("1.2.840.113549.1.1.1")
+            # AlgorithmIdentifier { rsaEncryption, NULL }
+            alg_id = _seq(rsa_oid + b"\x05\x00")
+            # keySpec [0] Controls ::= SEQUENCE OF AttributeTypeAndValue
+            # Simplified: just wrap the AlgorithmIdentifier
+            key_spec = _ctx_impl(1, _seq(alg_id))
+
+            template_content = _seq(key_spec)
+            info_val = _seq(_oid_bytes(OID_IT_GETCERTREQTEMPLATE) + template_content)
+            logger.info("genm GetCertReqTemplate: returning RSA-2048 template hint")
+            return _build_genp(info_val)
+
+        elif req_oid == OID_IT_CRLSTATUSLIST:
+            # RFC 9480 §4.3.6 — CRLUpdateRetrieve: return current CRL
+            crl_der = self.ca.generate_crl_der()
+            # CRLSource = CHOICE { dpn [0] DistributionPointName, issuer [1] GeneralNames }
+            # We return the CRL directly in the genp value as CRLs SEQUENCE OF CertificateList
+            crls = _seq(crl_der)
+            info_val = _seq(_oid_bytes(OID_IT_CRLUPDATERESP) + crls)
+            logger.info("genm CRLStatusList: returning current CRL")
+            return _build_genp(info_val)
+
+        else:
+            # Fallback: original CMPv2 CA cert info (id-it-caProtEncCert)
+            ca_der = self.ca.ca_cert_der
+            info_val = _seq(_oid_bytes(OID_IT_CAPROTENCERT) + _oct(ca_der))
+            logger.info(f"genm unknown OID {req_oid!r}: falling back to caProtEncCert")
+            return _build_genp(info_val)
+
+    def _extract_genm_oid(self, body_raw: bytes) -> Optional[str]:
+        """Extract the first InfoTypeAndValue OID from a GenMsgContent body."""
+        try:
+            # GenMsgContent ::= SEQUENCE OF InfoTypeAndValue
+            # InfoTypeAndValue ::= SEQUENCE { infoType OID, infoValue ANY OPTIONAL }
+            pos = 0
+            # outer SEQUENCE
+            tag, outer, pos = CMPv2ASN1._decode_tlv(body_raw, 0)
+            # first InfoTypeAndValue
+            tag2, itav, _ = CMPv2ASN1._decode_tlv(outer, 0)
+            # OID
+            tag3, oid_val, _ = CMPv2ASN1._decode_tlv(itav, 0)
+            if tag3 == 0x06:
+                return self._decode_oid_bytes(oid_val)
+        except Exception as e:
+            logger.debug(f"genm OID extraction failed: {e}")
+        return None
+
+    @staticmethod
+    def _decode_oid_bytes(data: bytes) -> str:
+        if not data:
+            return ""
+        parts = [data[0] // 40, data[0] % 40]
+        i, cur = 1, 0
+        while i < len(data):
+            cur = (cur << 7) | (data[i] & 0x7F)
+            if not (data[i] & 0x80):
+                parts.append(cur)
+                cur = 0
+            i += 1
+        return ".".join(map(str, parts))
+
+    # ------------------------------------------------------------------
+    # Extended polling (RFC 9480 §3.4)
+    # ------------------------------------------------------------------
+
+    def queue_for_polling(self, txid: bytes, response: bytes, delay_secs: int = 0):
+        """Store a ready or pending response in the polling table."""
+        with self._poll_lock:
+            self._polling_table[txid] = {
+                "status": "ready" if delay_secs == 0 else "waiting",
+                "response": response,
+                "deadline": time.time() + delay_secs,
+            }
+
+    def _handle_poll_req(self, msg: dict, txid: bytes, snonce: bytes, pvno: int) -> bytes:
+        """
+        Handle pollReq (body type 25) — RFC 9480 §3.4 extended polling.
+        RFC 4210 only defined polling for ir/cr/kur. RFC 9480 extends it
+        to p10cr, certConf, rr, genm, and error responses.
+        """
+        def _seq(c): return b"\x30" + CMPv2ASN1._encode_length(len(c)) + c
+        def _int(v): return b"\x02\x01" + bytes([v & 0xFF])
+        def _int_big(v):
+            if v == 0: return b"\x02\x01\x00"
+            raw = []
+            n = v
+            while n:
+                raw.append(n & 0xFF)
+                n >>= 8
+            raw.reverse()
+            if raw[0] & 0x80:
+                raw.insert(0, 0)
+            return b"\x02" + CMPv2ASN1._encode_length(len(raw)) + bytes(raw)
+
+        with self._poll_lock:
+            entry = self._polling_table.get(txid)
+
+        if entry is None:
+            # Unknown txid — send error
+            return self._build_error_v3(
+                txid, snonce, os.urandom(16), 2,
+                f"Unknown transactionID in pollReq", pvno
+            )
+
+        if entry["status"] == "ready" or time.time() >= entry["deadline"]:
+            # Return the queued response
+            with self._poll_lock:
+                self._polling_table.pop(txid, None)
+            logger.info(f"pollReq: txid={txid.hex()!r} — returning ready response")
+            return entry["response"]
+
+        # Still waiting — send pollRep
+        # PollRepContent ::= SEQUENCE OF SEQUENCE { certReqId INTEGER, checkAfter INTEGER, reason UTF8String }
+        check_after = max(1, int(entry["deadline"] - time.time()))
+        poll_entry = _seq(
+            _int_big(0)           # certReqId
+            + _int_big(check_after)  # checkAfter (seconds)
+        )
+        poll_rep_body = _seq(poll_entry)
+        logger.info(f"pollReq: txid={txid.hex()!r} — still waiting, checkAfter={check_after}s")
+        return CMPv2ASN1.build_pki_message(
+            26, poll_rep_body, txid, os.urandom(16), snonce, pvno=pvno
+        )
+
+    def _build_error_v3(
+        self, txid: bytes, snonce: bytes, recip_nonce: bytes,
+        status: int, text: str, pvno: int
+    ) -> bytes:
+        body = CMPv2ASN1.build_error_body(status, text)
+        return CMPv2ASN1.build_pki_message(
+            23, body, txid, os.urandom(16), snonce, pvno=pvno
+        )
+
+
+# ---------------------------------------------------------------------------
 # HTTP Server (RFC 6712 - CMP over HTTP)
 # ---------------------------------------------------------------------------
 
@@ -1532,6 +1847,15 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
         if client_cn:
             logger.info(f"Authenticated mTLS client: CN={client_cn}")
 
+        # RFC 9480/9811 well-known CMP URI (/.well-known/cmp[/p/<label>])
+        # Strip the well-known prefix for routing; the body is still PKIMessage DER
+        path = self.path.split("?")[0]
+        if path.startswith(CMP_WELL_KNOWN_PATH):
+            label = self._extract_cmp_label(path)
+            if label:
+                logger.info(f"CMP well-known URI — CA label: {label!r}")
+            # fall through to normal DER handling
+
         try:
             response_der = self.cmp_handler.handle(body)
             self.send_response(200)
@@ -1543,6 +1867,20 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
             logger.error(f"Handler error: {e}")
             self.send_response(500)
             self.end_headers()
+
+    @staticmethod
+    def _extract_cmp_label(path: str) -> Optional[str]:
+        """
+        Extract the CA label from a well-known CMP URI.
+        /.well-known/cmp/p/<label>/...  → label
+        /.well-known/cmp/<op>           → None
+        """
+        # Remove /.well-known/cmp prefix
+        rest = path[len(CMP_WELL_KNOWN_PATH):].lstrip("/")
+        parts = rest.split("/")
+        if len(parts) >= 2 and parts[0] == "p":
+            return parts[1]
+        return None
 
     def do_PATCH(self):
         """PATCH /config — live-update validity periods and other settings."""
@@ -1656,19 +1994,34 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                 "ca_serial": self.ca.ca_cert.serial_number,
             })
 
+        elif path.startswith(CMP_WELL_KNOWN_PATH):
+            # RFC 9811: GET /.well-known/cmp -> return CA certificate
+            label = self._extract_cmp_label(path)
+            data = self.ca.ca_cert_pem
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-pem-file")
+            self.send_header("Content-Length", str(len(data)))
+            if label:
+                self.send_header("X-CMP-CA-Label", label)
+            self.end_headers()
+            self.wfile.write(data)
+
         else:
             self._send_json({
                 "endpoints": {
-                    "POST /": "CMPv2 endpoint (Content-Type: application/pkixcmp)",
-                    "GET  /config": "View current configuration (validity periods etc.)",
+                    "POST /": "CMPv2/CMPv3 endpoint (application/pkixcmp)",
+                    "POST /.well-known/cmp": "RFC 9811 well-known CMP URI",
+                    "POST /.well-known/cmp/p/<label>": "Named CA well-known CMP URI (RFC 9811)",
+                    "GET  /config": "View current configuration",
                     "PATCH /config": "Live-update: PATCH /config with JSON {validity:{end_entity_days:90}}",
                     "GET /ca/cert.pem": "CA certificate (PEM)",
                     "GET /ca/cert.der": "CA certificate (DER)",
                     "GET /ca/crl": "Certificate Revocation List (DER)",
                     "GET /api/certs": "List issued certificates (JSON)",
                     "GET /api/whoami": "Show authenticated mTLS client identity",
-                    "GET /bootstrap?cn=<name>": "Issue client cert bundle (bootstrap port only)",
+                    "GET /bootstrap?cn=<n>": "Issue client cert bundle (bootstrap port only)",
                     "GET /health": "Health check",
+                    "GET /.well-known/cmp": "RFC 9811 well-known CMP CA cert (GET)",
                 }
             })
 
@@ -1715,6 +2068,15 @@ MTLSServer = TLSServer
 # ---------------------------------------------------------------------------
 
 def make_handler(ca: CertificateAuthority, cmp_handler: CMPv2Handler):
+    class BoundHandler(CMPv2HTTPHandler):
+        pass
+    BoundHandler.ca = ca
+    BoundHandler.cmp_handler = cmp_handler
+    return BoundHandler
+
+
+def make_cmpv3_handler(ca: CertificateAuthority, cmp_handler: CMPv3Handler):
+    """Make an HTTP handler that uses CMPv3Handler (with well-known URI support)."""
     class BoundHandler(CMPv2HTTPHandler):
         pass
     BoundHandler.ca = ca
@@ -1819,6 +2181,46 @@ def main():
         help="Auto-approve dns-01 challenges without DNS lookup (testing/internal CA only)"
     )
 
+    cmpv3_group = parser.add_argument_group(
+        "CMPv3 options (RFC 9480)",
+        "Enable CMPv3 features (pvno=3, new genm types, extended polling, "
+        "well-known URI paths). CMPv3 is auto-negotiated based on client pvno."
+    )
+    cmpv3_group.add_argument(
+        "--cmpv3", action="store_true", default=True,
+        help="Enable CMPv3 handler (auto-negotiates pvno=2/3, default: on)"
+    )
+    cmpv3_group.add_argument(
+        "--no-cmpv3", dest="cmpv3", action="store_false",
+        help="Force CMPv2 only (no RFC 9480 features)"
+    )
+
+    est_group = parser.add_argument_group(
+        "EST options (RFC 7030)",
+        "Enable Enrollment over Secure Transport. EST MUST run over TLS — "
+        "a server cert is auto-issued from the CA if not provided."
+    )
+    est_group.add_argument(
+        "--est-port", type=int, default=None, metavar="PORT",
+        help="Start EST server on this port (e.g. 8443)"
+    )
+    est_group.add_argument(
+        "--est-user", action="append", metavar="USER:PASS",
+        help="Add an EST Basic auth user (repeat for multiple)"
+    )
+    est_group.add_argument(
+        "--est-require-auth", action="store_true",
+        help="Require auth for EST (Basic or TLS client cert)"
+    )
+    est_group.add_argument(
+        "--est-tls-cert", metavar="PATH",
+        help="PEM server cert for EST HTTPS (defaults to CA auto-issue)"
+    )
+    est_group.add_argument(
+        "--est-tls-key", metavar="PATH",
+        help="PEM private key for --est-tls-cert"
+    )
+
     scep_group = parser.add_argument_group(
         "SCEP options (RFC 8894)",
         "Enable the SCEP protocol for network device certificate enrolment. "
@@ -1863,8 +2265,16 @@ def main():
     config = ServerConfig(ca_dir=ca_dir, cli_overrides=cli_overrides)
 
     ca = CertificateAuthority(ca_dir=args.ca_dir, config=config)
-    cmp_handler = CMPv2Handler(ca)
-    handler_class = make_handler(ca, cmp_handler)
+
+    # Use CMPv3Handler (RFC 9480) by default; fall back to CMPv2Handler if --no-cmpv3
+    if getattr(args, "cmpv3", True):
+        cmp_handler = CMPv3Handler(ca)
+        handler_class = make_cmpv3_handler(ca, cmp_handler)
+        logger.info("CMPv3 handler active (RFC 9480 — pvno auto-negotiation, well-known URI)")
+    else:
+        cmp_handler = CMPv2Handler(ca)
+        handler_class = make_handler(ca, cmp_handler)
+        logger.info("CMPv2 handler active (--no-cmpv3 specified)")
 
     scheme = "http"
     tls_mode_label = "plain HTTP"
@@ -1950,8 +2360,32 @@ def main():
                 challenge=args.scep_challenge,
             )
 
+    # Start EST server if requested
+    est_srv = None
+    if args.est_port:
+        if not HAS_EST:
+            print("WARNING: est_server.py not found — EST support disabled.")
+            print("         Place est_server.py in the same directory as pki_cmpv2_server.py.")
+        else:
+            est_users = {}
+            for entry in (args.est_user or []):
+                u, _, p = entry.partition(":")
+                est_users[u] = p
+            est_srv = _est_module.start_est_server(
+                host=args.host,
+                port=args.est_port,
+                ca=ca,
+                ca_dir=ca_dir,
+                users=est_users if est_users else None,
+                require_auth=args.est_require_auth,
+                tls_cert_path=args.est_tls_cert,
+                tls_key_path=args.est_tls_key,
+            )
+
     acme_line = f"http://{args.host}:{args.acme_port}/acme/directory" if (args.acme_port and HAS_ACME) else "disabled"
     scep_line = f"http://{args.host}:{args.scep_port}/scep" if (args.scep_port and HAS_SCEP) else "disabled"
+    est_line  = f"https://{args.host}:{args.est_port}/.well-known/est" if (args.est_port and HAS_EST) else "disabled"
+    cmp_wk    = f"{scheme}://{args.host}:{args.port}/.well-known/cmp"
     boot_line = f"http://{args.host}:{args.bootstrap_port}/bootstrap?cn=<n>" if args.bootstrap_port else "disabled"
 
     print(f"""
@@ -1964,6 +2398,8 @@ def main():
 ║  TLS Mode         : {tls_mode_label:<47}║
 ║  Bootstrap        : {boot_line:<47}║
 ║  Listening (SCEP) : {scep_line:<47}║
+║  Listening (EST)  : {est_line:<47}║
+║  CMP Well-Known   : {cmp_wk:<47}║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Validity periods (change live: PATCH /config)                  ║
 ║    End-entity   : {config.end_entity_days:<3} days                                       ║
@@ -1979,20 +2415,20 @@ def main():
 ║  CRL             : GET  {scheme}://{args.host}:{args.port}/ca/crl      ║
 ║  Health Check    : GET  {scheme}://{args.host}:{args.port}/health      ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported CMPv2 operations:                                    ║
-║    ir  - Initialization Request                                 ║
-║    cr  - Certification Request                                  ║
-║    kur - Key Update Request                                     ║
-║    rr  - Revocation Request                                     ║
-║    certConf - Certificate Confirmation                          ║
-║    genm - General Message (CA Info)                             ║
-║    p10cr - PKCS#10 Certificate Request                          ║
+║  Supported CMPv2/CMPv3 operations:                              ║
+║    ir, cr, kur, rr, certConf, genm, p10cr (CMPv2 / RFC 4210)   ║
+║    pollReq/pollRep - extended polling (CMPv3 / RFC 9480)        ║
+║    genm GetCACerts, GetRootCACertUpdate, GetCertReqTemplate     ║
+║    Well-known URI: POST/GET /.well-known/cmp[/p/<label>]        ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Supported ACME operations (RFC 8555):                         ║
 ║    new-account, new-order, http-01, dns-01, finalize, revoke   ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Supported SCEP operations (RFC 8894):                          ║
 ║    GetCACaps, GetCACert, PKCSReq, CertPoll, GetCert, GetCRL    ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Supported EST operations (RFC 7030):                           ║
+║    cacerts, simpleenroll, simplereenroll, csrattrs, serverkeygen║
 ╚══════════════════════════════════════════════════════════════════╝
 """)
 
@@ -2009,6 +2445,20 @@ def main():
         print(f"                   openssl pkey -in bundle.pem -out client.key")
         print(f"  3. curl --cert client.crt --key client.key --cacert {args.ca_dir}/ca.crt \\")
         print(f"          {scheme}://{args.tls_hostname}:{args.port}/health")
+        print()
+
+    if args.est_port and HAS_EST:
+        print("  EST Quick-start (RFC 7030):")
+        print(f"  1. Get CA chain:  curl --cacert {args.ca_dir}/ca.crt \\")
+        print(f"                       https://{args.host}:{args.est_port}/.well-known/est/cacerts | base64 -d > chain.p7")
+        print(f"  2. Enrol (openssl):")
+        print(f"     openssl req -new -key client.key -out client.csr -subj '/CN=mydevice'")
+        print(f"     curl -X POST --cacert {args.ca_dir}/ca.crt \\")
+        print(f"          --data-binary @<(base64 client.csr) \\")
+        print(f"          -H 'Content-Transfer-Encoding: base64' \\")
+        print(f"          https://{args.host}:{args.est_port}/.well-known/est/simpleenroll")
+        if args.est_require_auth:
+            print(f"     Add: -u 'username:password'")
         print()
 
     if args.scep_port and HAS_SCEP:
@@ -2031,6 +2481,9 @@ def main():
             print(f"  ⚠ dns-01 auto-approval is ON — do not use in production!")
         print()
 
+    if 'est_srv' not in dir():
+        est_srv = None
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2042,6 +2495,8 @@ def main():
             acme_srv.shutdown()
         if scep_srv:
             scep_srv.shutdown()
+        if est_srv:
+            est_srv.shutdown()
 
 if __name__ == "__main__":
     main()

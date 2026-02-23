@@ -5,8 +5,10 @@
 [![RFC 4210](https://img.shields.io/badge/RFC-4210%20CMPv2-informational)](https://www.rfc-editor.org/rfc/rfc4210)
 [![RFC 8555](https://img.shields.io/badge/RFC-8555%20ACME-informational)](https://www.rfc-editor.org/rfc/rfc8555)
 [![RFC 8894](https://img.shields.io/badge/RFC-8894%20SCEP-informational)](https://www.rfc-editor.org/rfc/rfc8894)
+[![RFC 9480](https://img.shields.io/badge/RFC-9480%20CMPv3-informational)](https://www.rfc-editor.org/rfc/rfc9480)
+[![RFC 7030](https://img.shields.io/badge/RFC-7030%20EST-informational)](https://www.rfc-editor.org/rfc/rfc7030)
 
-A self-contained, production-grade private Certificate Authority with support for three industry-standard certificate management protocols — **CMPv2** (RFC 4210) for embedded/IoT devices, **ACME** (RFC 8555) for servers and workstations, and **SCEP** (RFC 8894) for network devices and MDM-enrolled endpoints — plus an Ansible role for distributing the CA certificate to client machines.
+A self-contained, production-grade private Certificate Authority with support for four industry-standard certificate management protocols — **CMPv2/v3** (RFC 4210 / RFC 9480) for embedded/IoT devices, **ACME** (RFC 8555) for servers and workstations, **SCEP** (RFC 8894) for network devices and MDM-enrolled endpoints, and **EST** (RFC 7030) for TLS-capable devices — plus an Ansible role for distributing the CA certificate to client machines.
 
 ---
 
@@ -14,9 +16,10 @@ A self-contained, production-grade private Certificate Authority with support fo
 
 | File / Directory | Description |
 |---|---|
-| [`pki_cmpv2_server.py`](#pki-server) | CA + CMPv2 server + ACME + SCEP integration |
+| [`pki_cmpv2_server.py`](#pki-server) | CA + CMPv2/v3 server + ACME + SCEP + EST integration |
 | [`acme_server.py`](#acme-server) | ACME server module (RFC 8555) |
 | [`scep_server.py`](#scep-server) | SCEP server module (RFC 8894) |
+| [`est_server.py`](#est-server) | EST server module (RFC 7030) |
 | [`ca_import/`](#ansible-ca-import-role) | Ansible role to push the CA cert to client machines |
 | [`CHANGELOG.md`](CHANGELOG.md) | Full version history |
 | [`LICENSE`](LICENSE) | MIT License |
@@ -32,7 +35,7 @@ A self-contained, production-grade private Certificate Authority with support fo
 - CRL generation — served by CMPv2, ACME, and SCEP
 - Live-reloadable configuration (`PATCH /config` or `ca/config.json`)
 
-### CMPv2 Protocol (RFC 4210 / RFC 6712)
+### CMPv2 / CMPv3 Protocol (RFC 4210 / RFC 6712 / RFC 9480)
 | Operation | Type | Description |
 |---|---|---|
 | Initialization Request | `ir` / `ip` | First-time certificate enrollment |
@@ -42,6 +45,19 @@ A self-contained, production-grade private Certificate Authority with support fo
 | Certificate Confirmation | `certConf` / `pkiConf` | Two-phase commit |
 | General Message | `genm` / `genp` | CA info query |
 | PKCS#10 Request | `p10cr` / `cp` | Standard CSR submission |
+
+**CMPv3 extensions (RFC 9480) — auto-negotiated via `pvno` field:**
+
+| Feature | Description |
+|---|---|
+| `pvno=3` negotiation | Server mirrors client's pvno; CMPv2 clients unaffected |
+| `GetCACerts` | Returns all CA certs as `CACertSeq` (genm id-it 17) |
+| `GetRootCACertUpdate` | CA cert rollover preview — `newWithNew` (genm id-it 18) |
+| `GetCertReqTemplate` | Key type + extension hints for CSR construction (genm id-it 19) |
+| CRL update via genm | Returns current CRL (genm id-it 21/22) |
+| Extended polling | `pollReq`/`pollRep` for all message types (RFC 9480 §3.4) |
+| Well-known URI | `POST/GET /.well-known/cmp[/p/<label>]` (RFC 9811) |
+| Client error ack | Server acknowledges client `error` messages with `pkiconf` |
 
 ### ACME Protocol (RFC 8555)
 | Challenge type | Description |
@@ -64,6 +80,17 @@ Full key rollover support (RFC 8555 §7.3.5) — compatible with **acme.sh**, **
 | `GetNextCACert` | Preview next CA certificate (rollover) |
 
 Compatible with **Cisco IOS**, **Juniper**, **sscep**, **Windows NDES**, **Jamf**, **Microsoft Intune**, and any RFC 8894-compliant SCEP client.
+
+### EST Protocol (RFC 7030)
+| Operation | Description |
+|---|---|
+| `cacerts` | Download CA certificate chain (PKCS#7) |
+| `simpleenroll` | Enrol — submit PKCS#10 CSR, receive signed cert |
+| `simplereenroll` | Renew with existing TLS client certificate |
+| `csrattrs` | Download CSR attribute hints (key type, extensions) |
+| `serverkeygen` | Server generates key pair + cert, returns `multipart/mixed` |
+
+Authentication: **HTTP Basic** (username:password) and/or **TLS client certificate** — both active simultaneously. EST always runs over HTTPS.
 
 ### TLS
 - One-way TLS (`--tls`) and mutual TLS (`--mtls`)
@@ -98,15 +125,15 @@ Python 3.9 or later. No other runtime dependencies.
 python pki_cmpv2_server.py
 ```
 
-### 2. TLS + ACME + SCEP (staging/production)
+### 2. TLS + ACME + SCEP + EST (staging/production)
 
 ```bash
 python pki_cmpv2_server.py \
   --tls --port 8443 \
   --tls-hostname pki.internal \
   --acme-port 8888 \
-  --scep-port 8889 \
-  --scep-challenge mysecret \
+  --scep-port 8889 --scep-challenge mysecret \
+  --est-port 8444 \
   --alpn-h2 --alpn-cmp --alpn-acme
 ```
 
@@ -117,8 +144,8 @@ python pki_cmpv2_server.py \
   --mtls --port 8443 \
   --bootstrap-port 8080 \
   --acme-port 8888 \
-  --scep-port 8889 \
-  --scep-challenge mysecret
+  --scep-port 8889 --scep-challenge mysecret \
+  --est-port 8444 --est-user admin:secret
 
 # Issue a client cert via the bootstrap endpoint
 curl http://localhost:8080/bootstrap?cn=myclient -o bundle.pem
@@ -167,6 +194,17 @@ ACME options:
   --acme-base-url URL       Public base URL for ACME links
   --acme-auto-approve-dns   Skip DNS lookup for dns-01 (testing only)
 
+CMPv3 options (RFC 9480):
+  --cmpv3                   Enable CMPv3 handler (default: on)
+  --no-cmpv3                Force CMPv2-only mode
+
+EST options (RFC 7030):
+  --est-port PORT           Run EST server on this port (e.g. 8444)
+  --est-user USER:PASS      Add Basic auth user (repeatable)
+  --est-require-auth        Require auth (Basic or TLS client cert)
+  --est-tls-cert PATH       PEM server cert for EST HTTPS
+  --est-tls-key PATH        PEM private key for --est-tls-cert
+
 SCEP options:
   --scep-port PORT          Run SCEP server on this port (e.g. 8889)
   --scep-challenge SECRET   Challenge password for enrolment (empty = open)
@@ -192,6 +230,9 @@ Validity periods (also changeable live via PATCH /config):
 | `PATCH` | `/config` | Live-update configuration |
 | `GET` | `/bootstrap?cn=<n>` | Issue client cert bundle (bootstrap port) |
 | `GET` | `/health` | Health check |
+| `POST` | `/.well-known/cmp` | RFC 9811 well-known CMP endpoint |
+| `POST` | `/.well-known/cmp/p/<label>` | Named CA CMP endpoint (RFC 9811) |
+| `GET` | `/.well-known/cmp` | CA certificate (RFC 9811 discovery) |
 
 ### Live configuration
 
@@ -347,6 +388,86 @@ The server accepts the `/cgi-bin/pkiclient.exe` path used by NDES-compatible cli
 
 ---
 
+## EST Server
+
+Runs as a module integrated with the PKI server, or standalone:
+
+```bash
+# Standalone — open enrolment (no auth required)
+python est_server.py --port 8444 --ca-dir ./ca
+
+# With HTTP Basic auth user(s)
+python est_server.py --port 8444 --user admin:secret --user device:pass123
+
+# Require authentication
+python est_server.py --port 8444 --user admin:secret --require-auth
+```
+
+EST always runs over HTTPS. If no `--tls-cert`/`--tls-key` are provided, a server certificate is auto-issued from the CA.
+
+### EST endpoints
+
+All operations are under `/.well-known/est`. A CA label variant `/.well-known/est/<label>/<op>` is also accepted.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/.well-known/est/cacerts` | CA chain (base64 PKCS#7) |
+| `GET` | `/.well-known/est/csrattrs` | CSR attribute hints (base64 DER) |
+| `POST` | `/.well-known/est/simpleenroll` | Enrol — submit PKCS#10 CSR |
+| `POST` | `/.well-known/est/simplereenroll` | Renew with existing cert |
+| `POST` | `/.well-known/est/serverkeygen` | Server-generated key + cert |
+
+### Authentication
+
+EST supports both methods simultaneously. Either is sufficient:
+
+**HTTP Basic** — configure users with `--est-user USER:PASS` (or `--user` standalone). The server sends `401 + WWW-Authenticate` on failure.
+
+**TLS client certificate** — the server runs with `ssl.CERT_OPTIONAL`. A certificate signed by the CA is accepted automatically; no additional configuration needed.
+
+Use `--est-require-auth` to enforce that at least one method succeeds; omit it for open internal CAs.
+
+### Using with curl
+
+```bash
+# 1. Download CA chain
+curl --cacert ./ca/ca.crt \
+  https://pki.internal:8444/.well-known/est/cacerts \
+  | base64 -d > chain.p7
+
+# 2. Get CSR attribute hints
+curl --cacert ./ca/ca.crt \
+  https://pki.internal:8444/.well-known/est/csrattrs \
+  | base64 -d | openssl asn1parse -inform DER
+
+# 3. Generate key + CSR
+openssl genrsa -out client.key 2048
+openssl req -new -key client.key -out client.csr -subj "/CN=mydevice.internal"
+
+# 4. Enrol (Base64 DER CSR body, Basic auth)
+curl -X POST --cacert ./ca/ca.crt \
+  -u admin:secret \
+  -H "Content-Transfer-Encoding: base64" \
+  --data-binary "$(base64 client.csr)" \
+  https://pki.internal:8444/.well-known/est/simpleenroll \
+  | base64 -d > chain.p7
+
+# 5. Extract certificate from PKCS#7
+openssl pkcs7 -in chain.p7 -inform DER -print_certs -out client.crt
+
+# 6. Server-generated key + cert (no CSR needed)
+curl -X POST --cacert ./ca/ca.crt \
+  -u admin:secret \
+  https://pki.internal:8444/.well-known/est/serverkeygen \
+  -o keygen_response.multipart
+```
+
+### Using with estclient (Python / Go tools)
+
+Any RFC 7030-compliant client works. Popular options: `libest` (Cisco), `est` (Go), `python-estclient`. Point them at `https://pki.internal:8444/.well-known/est`.
+
+---
+
 ## Ansible CA Import Role
 
 Distributes the CA certificate to client machines across all major trust stores.
@@ -422,6 +543,7 @@ ca/
 ├── certificates.db     SQLite store of all issued certificates
 ├── acme.db             SQLite store of ACME accounts, orders, challenges
 ├── scep.db             SQLite store of SCEP enrolment transactions
+├── est/                EST TLS cert auto-issued here (if no --est-tls-cert)
 ├── config.json         Live server configuration (hot-reloaded)
 ├── server.crt          Auto-issued TLS server certificate
 └── server.key          TLS server private key
@@ -438,10 +560,13 @@ ca/
 | RFC 4210 | Certificate Management Protocol v2 | ✅ Full |
 | RFC 4211 | CRMF — Certificate Request Message Format | ✅ Full |
 | RFC 6712 | CMP over HTTP | ✅ Full |
-| RFC 9483 | CMP Updates (ALPN `cmpc`) | ✅ ALPN only |
+| RFC 9483 | Lightweight CMP Profile (ALPN `cmpc`) | ✅ ALPN |
 | RFC 8555 | ACME — Automatic Certificate Management | ✅ Full |
 | RFC 8737 | ACME `tls-alpn-01` challenge | ✅ Full |
 | RFC 8894 | SCEP — Simple Certificate Enrolment Protocol | ✅ Full |
+| RFC 9480 | CMP Updates — CMPv3 features | ✅ Full |
+| RFC 9811 | CMP well-known URI paths | ✅ Full |
+| RFC 7030 | EST — Enrollment over Secure Transport | ✅ Full |
 | RFC 7301 | TLS ALPN Extension | ✅ Full |
 | RFC 7638 | JWK Thumbprint | ✅ Full |
 | RFC 5280 | X.509 Certificates and CRL profile | ✅ Full |
