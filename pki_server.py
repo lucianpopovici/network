@@ -48,16 +48,16 @@ Dependencies:
 
 Usage:
     # Plain HTTP (no mTLS)
-    python pki_cmpv2_server.py [--host 0.0.0.0] [--port 8080] [--ca-dir ./ca]
+    python pki_server.py [--host 0.0.0.0] [--port 8080] [--ca-dir ./ca]
 
     # mTLS enabled
-    python pki_cmpv2_server.py --mtls --port 8443 [--ca-dir ./ca]
+    python pki_server.py --mtls --port 8443 [--ca-dir ./ca]
 
     # mTLS + ACME on a second port
-    python pki_cmpv2_server.py --mtls --port 8443 --acme-port 8888 [--ca-dir ./ca]
+    python pki_server.py --mtls --port 8443 --acme-port 8888 [--ca-dir ./ca]
 
     # ACME with dns-01 auto-approve (testing/internal CA only)
-    python pki_cmpv2_server.py --acme-port 8888 --acme-auto-approve-dns
+    python pki_server.py --acme-port 8888 --acme-auto-approve-dns
 """
 
 import argparse
@@ -3061,7 +3061,7 @@ def main():
     if args.acme_port:
         if not HAS_ACME:
             print("WARNING: acme_server.py not found — ACME support disabled.")
-            print("         Place acme_server.py in the same directory as pki_cmpv2_server.py.")
+            print("         Place acme_server.py in the same directory as pki_server.py.")
         else:
             acme_base = args.acme_base_url or f"http://{args.host}:{args.acme_port}"
             acme_srv = _acme_module.start_acme_server(
@@ -3080,7 +3080,7 @@ def main():
     if args.scep_port:
         if not HAS_SCEP:
             print("WARNING: scep_server.py not found — SCEP support disabled.")
-            print("         Place scep_server.py in the same directory as pki_cmpv2_server.py.")
+            print("         Place scep_server.py in the same directory as pki_server.py.")
         else:
             scep_srv = _scep_module.start_scep_server(
                 host=args.host,
@@ -3095,7 +3095,7 @@ def main():
     if args.est_port:
         if not HAS_EST:
             print("WARNING: est_server.py not found — EST support disabled.")
-            print("         Place est_server.py in the same directory as pki_cmpv2_server.py.")
+            print("         Place est_server.py in the same directory as pki_server.py.")
         else:
             est_users = {}
             for entry in (args.est_user or []):
