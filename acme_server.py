@@ -30,6 +30,12 @@ Supported challenge types:
   - dns-01   : Client creates a TXT record at _acme-challenge.<domain>
                (validation is simulated/manual in this implementation)
 
+RFC 9608 — No Revocation Available:
+  Certificates with validity <= short_lived_threshold_days (default 7) automatically
+  receive the id-ce-noRevAvail extension (OID 2.5.29.56, non-critical, NULL value) and
+  have CDP and AIA-OCSP extensions suppressed, per RFC 9608 §4.
+  Standard 90-day certs use the tls_server profile (with CDP/AIA if configured).
+
 ACME flow (RFC 8555 §7):
   1. GET  /acme/directory          → directory URLs
   2. HEAD /acme/new-nonce          → fresh nonce (Replay-Nonce header)
@@ -707,6 +713,8 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
     ca = None             # CertificateAuthority instance
     validator: ChallengeValidator = None
     base_url: str = ""    # e.g. "http://localhost:8888"
+    cert_validity_days: int = 90        # validity for ACME-issued certs
+    short_lived_threshold_days: int = 7 # certs valid <= this get noRevAvail (RFC 9608)
 
     def log_message(self, format, *args):
         logger.info(f"ACME {self.address_string()} - {format % args}")
@@ -1188,15 +1196,29 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Issue the certificate
+        # RFC 9608: if validity <= short_lived_threshold_days, use short_lived profile
+        # which adds id-ce-noRevAvail and suppresses CDP + AIA-OCSP
         try:
             domains = sorted(csr_domains)
             primary_domain = domains[0] if domains else "acme-client"
             subject_str = f"CN={primary_domain}"
 
+            validity = self.cert_validity_days
+            if validity <= self.short_lived_threshold_days:
+                profile = "short_lived"
+                logger.info(
+                    f"ACME cert validity={validity}d <= threshold={self.short_lived_threshold_days}d: "
+                    "applying RFC 9608 noRevAvail (profile=short_lived)"
+                )
+            else:
+                profile = "tls_server"
+
             cert = self.ca.issue_certificate(
                 subject_str=subject_str,
                 public_key=csr.public_key(),
                 san_dns=list(csr_domains),
+                validity_days=validity,
+                profile=profile,
             )
 
             cert_pem = cert.public_bytes(Encoding.PEM).decode()
@@ -1206,7 +1228,10 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             cert_id = self.db.store_certificate(order_id, pem_chain, cert.serial_number)
             self.db.update_order(order_id, status="valid", cert_id=cert_id)
 
-            logger.info(f"ACME cert issued: serial={cert.serial_number} domains={domains}")
+            logger.info(
+                f"ACME cert issued: serial={cert.serial_number} domains={domains} "
+                f"profile={profile} validity={validity}d"
+            )
         except Exception as e:
             logger.error(f"Certificate issuance failed: {e}")
             self._send_error(500, "urn:ietf:params:acme:error:serverInternal",
@@ -1511,13 +1536,22 @@ class ThreadedACMEServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
 
-def make_acme_handler(db: ACMEDatabase, ca, validator: ChallengeValidator, base_url: str):
+def make_acme_handler(
+    db: ACMEDatabase,
+    ca,
+    validator: ChallengeValidator,
+    base_url: str,
+    cert_validity_days: int = 90,
+    short_lived_threshold_days: int = 7,
+):
     class BoundACMEHandler(ACMEHandler):
         pass
-    BoundACMEHandler.db        = db
-    BoundACMEHandler.ca        = ca
-    BoundACMEHandler.validator = validator
-    BoundACMEHandler.base_url  = base_url
+    BoundACMEHandler.db                       = db
+    BoundACMEHandler.ca                       = ca
+    BoundACMEHandler.validator                = validator
+    BoundACMEHandler.base_url                 = base_url
+    BoundACMEHandler.cert_validity_days       = cert_validity_days
+    BoundACMEHandler.short_lived_threshold_days = short_lived_threshold_days
     return BoundACMEHandler
 
 
@@ -1529,6 +1563,8 @@ def start_acme_server(
     auto_approve_dns: bool = False,
     base_url: Optional[str] = None,
     enable_tls_alpn01: bool = False,
+    cert_validity_days: int = 90,
+    short_lived_threshold_days: int = 7,
 ) -> ThreadedACMEServer:
     """
     Start the ACME server in a background thread.
@@ -1538,6 +1574,10 @@ def start_acme_server(
         enable_tls_alpn01: If True, the tls-alpn-01 challenge type is offered
                            and validated. Requires the main server to advertise
                            "acme-tls/1" via ALPN (--alpn-acme flag).
+        cert_validity_days: Validity period for ACME-issued certificates (default: 90).
+        short_lived_threshold_days: Certs with validity <= this value automatically
+                           receive the RFC 9608 id-ce-noRevAvail extension and have
+                           CDP / AIA-OCSP suppressed (default: 7 days).
     """
     if base_url is None:
         base_url = f"http://{host}:{port}"
@@ -1548,7 +1588,11 @@ def start_acme_server(
         auto_approve_dns=auto_approve_dns,
         tls_alpn01_enabled=enable_tls_alpn01,
     )
-    handler = make_acme_handler(db, ca, validator, base_url)
+    handler = make_acme_handler(
+        db, ca, validator, base_url,
+        cert_validity_days=cert_validity_days,
+        short_lived_threshold_days=short_lived_threshold_days,
+    )
 
     server = ThreadedACMEServer((host, port), handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)

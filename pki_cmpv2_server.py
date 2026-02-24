@@ -90,6 +90,11 @@ from cryptography.hazmat.primitives.serialization import (
     Encoding, PrivateFormat, PublicFormat, NoEncryption
 )
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+
+# RFC 9608 — No Revocation Available extension OID (id-ce 56)
+OID_NO_REV_AVAIL = x509.ObjectIdentifier("2.5.29.56")
+NO_REV_AVAIL_THRESHOLD_DAYS = 7  # certs valid <=7 days SHOULD carry noRevAvail
+from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as sym_padding
 
@@ -113,6 +118,20 @@ try:
     HAS_EST = True
 except ImportError:
     HAS_EST = False
+
+# OCSP responder module (optional — loaded if --ocsp-port is specified)
+try:
+    import ocsp_server as _ocsp_module
+    HAS_OCSP = True
+except ImportError:
+    HAS_OCSP = False
+
+# Web UI module (optional — loaded if --web-port is specified)
+try:
+    import web_ui as _web_ui_module
+    HAS_WEBUI = True
+except ImportError:
+    HAS_WEBUI = False
 
 # ASN.1 imports for CMPv2 message parsing
 try:
@@ -699,17 +718,208 @@ class CMPv2ASN1:
 
 
 # ---------------------------------------------------------------------------
+# Audit Log
+# ---------------------------------------------------------------------------
+
+class AuditLog:
+    """
+    Structured audit log stored in SQLite.
+    Every certificate issuance, revocation, auth event and config change is recorded.
+    """
+
+    def __init__(self, ca_dir: Path):
+        self._db = ca_dir / "audit.db"
+        self._init()
+
+    def _init(self):
+        conn = sqlite3.connect(str(self._db))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts      TEXT NOT NULL,
+                event   TEXT NOT NULL,
+                detail  TEXT,
+                ip      TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def record(self, event: str, detail: str = "", ip: str = ""):
+        ts = datetime.datetime.utcnow().isoformat()
+        conn = sqlite3.connect(str(self._db))
+        conn.execute("INSERT INTO audit(ts,event,detail,ip) VALUES(?,?,?,?)",
+                     (ts, event, detail, ip))
+        conn.commit()
+        conn.close()
+        logger.info(f"AUDIT [{event}] {detail}")
+
+    def recent(self, n: int = 100) -> List[Dict[str, Any]]:
+        conn = sqlite3.connect(str(self._db))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT ts,event,detail,ip FROM audit ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiter
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """
+    Token-bucket rate limiter per IP address.
+    Applied to all certificate issuance endpoints.
+    """
+
+    def __init__(self, max_per_minute: int = 10):
+        self._max   = max_per_minute
+        self._data: Dict[str, List[float]] = {}   # ip -> list of timestamps
+        self._lock  = threading.Lock()
+
+    def allow(self, ip: str) -> bool:
+        now = time.time()
+        window = 60.0
+        with self._lock:
+            timestamps = self._data.get(ip, [])
+            # Remove timestamps outside the window
+            timestamps = [t for t in timestamps if now - t < window]
+            if len(timestamps) >= self._max:
+                return False
+            timestamps.append(now)
+            self._data[ip] = timestamps
+        return True
+
+    def status(self, ip: str) -> Dict[str, Any]:
+        now = time.time()
+        with self._lock:
+            timestamps = [t for t in self._data.get(ip, []) if now - t < 60]
+        return {"ip": ip, "requests_last_minute": len(timestamps), "limit": self._max}
+
+
+# ---------------------------------------------------------------------------
+# Certificate Profiles
+# ---------------------------------------------------------------------------
+
+class CertProfile:
+    """
+    Named certificate profiles that control extensions, key usage, and validity.
+
+    Built-in profiles:
+      tls_server   — serverAuth EKU, SAN required, digitalSignature + keyEncipherment
+      tls_client   — clientAuth EKU, digitalSignature
+      code_signing — codeSigning EKU, digitalSignature + contentCommitment
+      email        — emailProtection EKU, digitalSignature + keyEncipherment
+      ocsp_signing — OCSPSigning EKU, nocheck extension
+      sub_ca       — BasicConstraints cA=True, keyCertSign + cRLSign
+      default      — end-entity, all key usages, no EKU restriction
+    """
+
+    PROFILES = {
+        "tls_server": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=True, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.SERVER_AUTH],
+            "san_required": True,
+            "bc_ca": False,
+        },
+        "tls_client": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.CLIENT_AUTH],
+            "san_required": False,
+            "bc_ca": False,
+        },
+        "code_signing": {
+            "key_usage": dict(digital_signature=True, content_commitment=True,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.CODE_SIGNING],
+            "san_required": False,
+            "bc_ca": False,
+        },
+        "email": {
+            "key_usage": dict(digital_signature=True, content_commitment=True,
+                              key_encipherment=True, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.EMAIL_PROTECTION],
+            "san_required": False,
+            "bc_ca": False,
+        },
+        "ocsp_signing": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.OCSP_SIGNING],
+            "san_required": False,
+            "bc_ca": False,
+            "ocsp_nocheck": True,
+        },
+        "sub_ca": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=False, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=True,
+                              crl_sign=True, encipher_only=False, decipher_only=False),
+            "eku": [],
+            "san_required": False,
+            "bc_ca": True,
+            "path_length": 0,
+        },
+        "default": {
+            "key_usage": dict(digital_signature=True, content_commitment=True,
+                              key_encipherment=True, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [],
+            "san_required": False,
+            "bc_ca": False,
+        },
+        # RFC 9608 — Short-lived end-entity cert.
+        # id-ce-noRevAvail (2.5.29.56) is added; CDP and AIA-OCSP are suppressed.
+        # RFC 9608 §4: MUST NOT be a CA cert; MUST NOT have CDP or OCSP AIA.
+        "short_lived": {
+            "key_usage": dict(digital_signature=True, content_commitment=False,
+                              key_encipherment=True, data_encipherment=False,
+                              key_agreement=False, key_cert_sign=False,
+                              crl_sign=False, encipher_only=False, decipher_only=False),
+            "eku": [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
+            "san_required": False,
+            "bc_ca": False,
+            "no_rev_avail": True,   # triggers id-ce-noRevAvail extension
+            "suppress_cdp": True,   # RFC 9608 §4: MUST NOT include CDP
+            "suppress_ocsp_aia": True,  # RFC 9608 §4: MUST NOT include AIA OCSP
+        },
+    }
+
+    @classmethod
+    def get(cls, name: str) -> Dict[str, Any]:
+        return cls.PROFILES.get(name, cls.PROFILES["default"])
+
+
+# ---------------------------------------------------------------------------
 # Certificate Authority
 # ---------------------------------------------------------------------------
 
 class CertificateAuthority:
     """Self-signed CA with certificate issuance and revocation."""
 
-    def __init__(self, ca_dir: str = "./ca", config: Optional["ServerConfig"] = None):
+    def __init__(self, ca_dir: str = "./ca", config: Optional["ServerConfig"] = None,
+                 ocsp_url: str = "", crl_url: str = ""):
         self.ca_dir = Path(ca_dir)
         self.ca_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.ca_dir / "certificates.db"
         self.config  = config  # may be None (uses hardcoded defaults as fallback)
+        self._ocsp_url = ocsp_url   # embedded in every issued cert AIA extension
+        self._crl_url  = crl_url    # embedded in every issued cert CDP extension
         self._init_db()
         self._load_or_create_ca()
 
@@ -724,7 +934,8 @@ class CertificateAuthority:
                 der         BLOB NOT NULL,
                 revoked     INTEGER DEFAULT 0,
                 revoked_at  TEXT,
-                reason      INTEGER
+                reason      INTEGER,
+                profile     TEXT DEFAULT 'default'
             )
         """)
         conn.execute("""
@@ -733,7 +944,21 @@ class CertificateAuthority:
                 value INTEGER NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS crl_base (
+                id          INTEGER PRIMARY KEY,
+                issued_at   TEXT NOT NULL,
+                this_update TEXT NOT NULL,
+                next_update TEXT NOT NULL,
+                der         BLOB NOT NULL
+            )
+        """)
         conn.execute("INSERT OR IGNORE INTO serial_counter VALUES (1, 1000)")
+        # Migrate: add profile column if missing (for existing DBs)
+        try:
+            conn.execute("ALTER TABLE certificates ADD COLUMN profile TEXT DEFAULT 'default'")
+        except Exception:
+            pass
         conn.commit()
         conn.close()
 
@@ -811,12 +1036,47 @@ class CertificateAuthority:
     def issue_certificate(
         self,
         subject_str: str,
-        public_key: RSAPublicKey,
+        public_key,
         validity_days: Optional[int] = None,
         is_ca: bool = False,
         san_dns: Optional[list] = None,
+        san_emails: Optional[list] = None,
+        san_ips: Optional[list] = None,
+        profile: str = "default",
+        ocsp_url: Optional[str] = None,
+        crl_url: Optional[str] = None,
+        no_rev_avail: Optional[bool] = None,
+        audit: Optional["AuditLog"] = None,
+        requester_ip: str = "",
     ) -> x509.Certificate:
-        """Issue a certificate signed by this CA."""
+        """
+        Issue a certificate signed by this CA.
+
+        profile      : one of the CertProfile names (tls_server, tls_client,
+                       code_signing, email, ocsp_signing, sub_ca, short_lived, default)
+        ocsp_url     : if set, adds an AIA extension with OCSP access description
+        crl_url      : if set, adds a CRL Distribution Points extension
+        no_rev_avail : if True, adds the RFC 9608 id-ce-noRevAvail (OID 2.5.29.56)
+                       extension and suppresses CDP and AIA-OCSP extensions.
+                       If None (default), determined automatically from the profile.
+                       RFC 9608 §4: MUST NOT appear in CA certs; MUST NOT coexist
+                       with CDP or AIA OCSP AccessDescription.
+        """
+        prof = CertProfile.get(profile)
+        is_ca = is_ca or prof.get("bc_ca", False)
+
+        # RFC 9608 — resolve noRevAvail: explicit parameter wins, else profile default
+        # MUST NOT appear in CA certificates (RFC 9608 §4 para 2)
+        if no_rev_avail is None:
+            no_rev_avail = prof.get("no_rev_avail", False)
+        if is_ca:
+            no_rev_avail = False  # RFC 9608 §4: MUST NOT be set on CA certs
+
+        # CDP / AIA-OCSP suppression per RFC 9608 §4:
+        # "A certificate with noRevAvail MUST NOT include the CDP or AIA OCSP extensions"
+        suppress_cdp      = no_rev_avail or prof.get("suppress_cdp", False)
+        suppress_ocsp_aia = no_rev_avail or prof.get("suppress_ocsp_aia", False)
+
         if validity_days is None:
             validity_days = self._cfg("end_entity_days", 365)
 
@@ -834,6 +1094,7 @@ class CertificateAuthority:
                 "C": NameOID.COUNTRY_NAME,
                 "L": NameOID.LOCALITY_NAME,
                 "ST": NameOID.STATE_OR_PROVINCE_NAME,
+                "EMAIL": NameOID.EMAIL_ADDRESS,
             }
             if key.strip().upper() in oid_map:
                 attrs.append(x509.NameAttribute(oid_map[key.strip().upper()], val.strip()))
@@ -844,6 +1105,12 @@ class CertificateAuthority:
         subject = x509.Name(attrs)
         serial = self._next_serial()
         now = datetime.datetime.utcnow()
+        path_len = prof.get("path_length", 0) if is_ca else None
+
+        ku = prof["key_usage"].copy()
+        if is_ca:
+            ku["key_cert_sign"] = True
+            ku["crl_sign"] = True
 
         builder = (
             x509.CertificateBuilder()
@@ -854,7 +1121,7 @@ class CertificateAuthority:
             .not_valid_before(now)
             .not_valid_after(now + datetime.timedelta(days=validity_days))
             .add_extension(
-                x509.BasicConstraints(ca=is_ca, path_length=0 if is_ca else None),
+                x509.BasicConstraints(ca=is_ca, path_length=path_len),
                 critical=True,
             )
             .add_extension(
@@ -865,41 +1132,124 @@ class CertificateAuthority:
                 x509.AuthorityKeyIdentifier.from_issuer_public_key(self.ca_key.public_key()),
                 critical=False,
             )
-            .add_extension(
-                x509.KeyUsage(
-                    digital_signature=True, content_commitment=True,
-                    key_encipherment=True, data_encipherment=False,
-                    key_agreement=False, key_cert_sign=is_ca,
-                    crl_sign=is_ca, encipher_only=False, decipher_only=False,
-                ),
-                critical=True,
-            )
+            .add_extension(x509.KeyUsage(**ku), critical=True)
         )
 
-        if san_dns:
+        # EKU
+        if prof.get("eku"):
             builder = builder.add_extension(
-                x509.SubjectAlternativeName([x509.DNSName(d) for d in san_dns]),
+                x509.ExtendedKeyUsage(prof["eku"]), critical=False
+            )
+
+        # OCSP no-check (for OCSP signing certs)
+        if prof.get("ocsp_nocheck"):
+            builder = builder.add_extension(
+                x509.UnrecognizedExtension(
+                    x509.ObjectIdentifier("1.3.6.1.5.5.7.48.1.5"),
+                    b"\x05\x00",
+                ),
                 critical=False,
+            )
+
+        # RFC 9608 — id-ce-noRevAvail (OID 2.5.29.56)
+        # Signals that the CA will never publish revocation information for this cert.
+        # Value is an ASN.1 NULL (0x05 0x00). Extension MUST be non-critical (§4).
+        if no_rev_avail:
+            builder = builder.add_extension(
+                x509.UnrecognizedExtension(
+                    OID_NO_REV_AVAIL,
+                    b"\x05\x00",  # NULL — the extension has no value per RFC 9608
+                ),
+                critical=False,
+            )
+
+        # SAN — collect DNS names, emails, IPs
+        san_names = []
+        if san_dns:
+            for d in san_dns:
+                san_names.append(x509.DNSName(d))
+        if san_emails:
+            for e in san_emails:
+                san_names.append(x509.RFC822Name(e))
+        if san_ips:
+            import ipaddress
+            for ip in san_ips:
+                try:
+                    san_names.append(x509.IPAddress(ipaddress.ip_address(ip)))
+                except ValueError:
+                    pass
+
+        if san_names:
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName(san_names), critical=False
+            )
+
+        # AIA — OCSP URL
+        # RFC 9608 §4: MUST NOT include AIA OCSP if noRevAvail is set
+        if not suppress_ocsp_aia and (ocsp_url or self._ocsp_url):
+            url = ocsp_url or self._ocsp_url
+            builder = builder.add_extension(
+                x509.AuthorityInformationAccess([
+                    x509.AccessDescription(
+                        x509.AuthorityInformationAccessOID.OCSP,
+                        x509.UniformResourceIdentifier(url),
+                    )
+                ]),
+                critical=False,
+            )
+        elif no_rev_avail and (ocsp_url or self._ocsp_url):
+            logger.debug(
+                f"Suppressed AIA-OCSP on serial={self._next_serial.__self__ if False else '?'}: "
+                "RFC 9608 §4 prohibits AIA OCSP when noRevAvail is set"
+            )
+
+        # CDP — CRL distribution point
+        # RFC 9608 §4: MUST NOT include CDP if noRevAvail is set
+        if not suppress_cdp and (crl_url or self._crl_url):
+            url = crl_url or self._crl_url
+            builder = builder.add_extension(
+                x509.CRLDistributionPoints([
+                    x509.DistributionPoint(
+                        full_name=[x509.UniformResourceIdentifier(url)],
+                        relative_name=None,
+                        reasons=None,
+                        crl_issuer=None,
+                    )
+                ]),
+                critical=False,
+            )
+        elif no_rev_avail and (crl_url or self._crl_url):
+            logger.debug(
+                "Suppressed CDP: RFC 9608 §4 prohibits CRL Distribution Points "
+                "when noRevAvail is set"
             )
 
         cert = builder.sign(self.ca_key, SHA256())
 
-        # Store in DB
+        # Store in DB (including profile)
         conn = sqlite3.connect(str(self.db_path))
-        conn.execute(
-            "INSERT INTO certificates VALUES (?,?,?,?,?,0,NULL,NULL)",
-            (
-                serial,
-                subject_str,
-                now.isoformat(),
-                (now + datetime.timedelta(days=validity_days)).isoformat(),
-                cert.public_bytes(Encoding.DER),
-            ),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "INSERT INTO certificates(serial,subject,not_before,not_after,der,revoked,revoked_at,reason,profile) "
+                "VALUES(?,?,?,?,?,0,NULL,NULL,?)",
+                (
+                    serial,
+                    subject_str,
+                    now.isoformat(),
+                    (now + datetime.timedelta(days=validity_days)).isoformat(),
+                    cert.public_bytes(Encoding.DER),
+                    profile,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
-        logger.info(f"Issued certificate serial={serial} subject='{subject_str}'")
+        if audit:
+            audit.record("issue", f"serial={serial} subject='{subject_str}' profile={profile}",
+                         requester_ip)
+
+        logger.info(f"Issued certificate serial={serial} subject='{subject_str}' profile={profile}")
         return cert
 
     def generate_ephemeral_key_and_cert(self, subject_str: str) -> Tuple[RSAPrivateKey, x509.Certificate]:
@@ -1286,6 +1636,172 @@ class CertificateAuthority:
             conn.close()
         crl = builder.sign(private_key=self.ca_key, algorithm=SHA256())
         return crl.public_bytes(Encoding.DER)
+
+    # ------------------------------------------------------------------
+    # Sub-CA issuance
+    # ------------------------------------------------------------------
+
+    def issue_sub_ca(
+        self,
+        cn: str,
+        validity_days: int = 1825,
+        path_length: int = 0,
+        audit: Optional["AuditLog"] = None,
+    ):
+        """
+        Issue a subordinate CA certificate signed by this root CA.
+        Returns (private_key, certificate).
+        The caller is responsible for securely distributing the private key.
+        """
+        priv_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+        subject_str = f"CN={cn},O=PyPKI Subordinate CA"
+        cert = self.issue_certificate(
+            subject_str=subject_str,
+            public_key=priv_key.public_key(),
+            validity_days=validity_days,
+            is_ca=True,
+            profile="sub_ca",
+            audit=audit,
+        )
+        logger.info(f"Sub-CA issued: CN={cn} serial={cert.serial_number} path_length={path_length}")
+        return priv_key, cert
+
+    # ------------------------------------------------------------------
+    # PKCS#12 export (cert + CA chain, no private key stored server-side)
+    # ------------------------------------------------------------------
+
+    def export_pkcs12(self, serial: int, password: Optional[bytes] = None) -> Optional[bytes]:
+        """
+        Return a PKCS#12 bundle containing the certificate + CA chain.
+        Private key is NOT included (it is never stored server-side).
+        """
+        der = self.get_cert_by_serial(serial)
+        if not der:
+            return None
+        cert = x509.load_der_x509_certificate(der)
+        enc = serialization.BestAvailableEncryption(password) if password else serialization.NoEncryption()
+        p12 = pkcs12.serialize_key_and_certificates(
+            name=f"cert-{serial}".encode(),
+            key=None,
+            cert=cert,
+            cas=[self.ca_cert],
+            encryption_algorithm=enc,
+        )
+        return p12
+
+    # ------------------------------------------------------------------
+    # Delta CRL (RFC 5280 §5.2.4)
+    # ------------------------------------------------------------------
+
+    def generate_delta_crl(self, base_crl_number: int = 1) -> bytes:
+        """
+        Generate a delta CRL containing only revocations since the last base CRL.
+        Stores the current CRL as the new base in crl_base table.
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+
+        # Fetch the timestamp of the last base CRL
+        base_row = conn.execute(
+            "SELECT issued_at, this_update FROM crl_base ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        base_issued_at = base_row["issued_at"] if base_row else "1970-01-01T00:00:00"
+
+        # Only revocations AFTER the last base
+        rows = conn.execute(
+            "SELECT serial, revoked_at, reason FROM certificates "
+            "WHERE revoked=1 AND revoked_at > ?",
+            (base_issued_at,)
+        ).fetchall()
+        conn.close()
+
+        now = datetime.datetime.utcnow()
+        next_update = now + datetime.timedelta(hours=6)
+
+        builder = (
+            x509.CertificateRevocationListBuilder()
+            .issuer_name(self.ca_cert.subject)
+            .last_update(now)
+            .next_update(next_update)
+            # Delta CRL indicator extension (id-ce-deltaCRLIndicator)
+            .add_extension(
+                x509.DeltaCRLIndicator(base_crl_number), critical=True
+            )
+        )
+
+        for row in rows:
+            rev = (
+                x509.RevokedCertificateBuilder()
+                .serial_number(row["serial"])
+                .revocation_date(
+                    datetime.datetime.fromisoformat(row["revoked_at"])
+                    if row["revoked_at"] else now
+                )
+                .build()
+            )
+            builder = builder.add_revoked_certificate(rev)
+
+        crl = builder.sign(self.ca_key, SHA256())
+        delta_der = crl.public_bytes(Encoding.DER)
+
+        # Store current full-CRL as new base
+        full_crl_der = self.generate_crl()
+        conn2 = sqlite3.connect(str(self.db_path))
+        conn2.execute(
+            "INSERT INTO crl_base(issued_at, this_update, next_update, der) VALUES(?,?,?,?)",
+            (now.isoformat(), now.isoformat(), next_update.isoformat(), full_crl_der)
+        )
+        conn2.commit()
+        conn2.close()
+
+        logger.info(f"Delta CRL generated: {len(rows)} new revocations since {base_issued_at}")
+        return delta_der
+
+    # ------------------------------------------------------------------
+    # CSR validation (naming policy)
+    # ------------------------------------------------------------------
+
+    def validate_csr(self, csr: x509.CertificateSigningRequest, profile: str = "default") -> List[str]:
+        """
+        Validate a CSR against policy rules.
+        Returns a list of violation strings (empty = valid).
+        """
+        violations = []
+
+        if not csr.is_signature_valid:
+            violations.append("CSR signature is invalid")
+
+        # Extract CN
+        try:
+            cn = csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+        except (IndexError, Exception):
+            cn = ""
+
+        if not cn:
+            violations.append("CSR must have a Common Name (CN)")
+
+        # Profile-specific checks
+        if profile == "tls_server":
+            # CN or SAN must be a valid FQDN or IP
+            import re
+            fqdn_re = re.compile(r'^(\*\.)?([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$')
+            if cn and not fqdn_re.match(cn) and cn not in ("localhost",):
+                violations.append(f"TLS server CN '{cn}' does not appear to be a valid FQDN")
+            # Must have SAN
+            try:
+                csr.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            except x509.ExtensionNotFound:
+                violations.append("TLS server certificates must include a SubjectAlternativeName extension")
+
+        # Key size check
+        try:
+            pub = csr.public_key()
+            if hasattr(pub, "key_size") and pub.key_size < 2048:
+                violations.append(f"RSA key size {pub.key_size} is below minimum 2048 bits")
+        except Exception:
+            pass
+
+        return violations
 
     @property
     def ca_cert_der(self) -> bytes:
@@ -1814,6 +2330,8 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
 
     cmp_handler: CMPv2Handler = None  # Set by server
     ca: CertificateAuthority = None
+    audit_log: "AuditLog" = None
+    rate_limiter: "RateLimiter" = None
 
     def log_message(self, format, *args):
         client_cn = self._get_client_cn()
@@ -1833,9 +2351,64 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
             pass
         return None
 
+    def do_POST_api(self, path: str, body: bytes):
+        """Handle POST requests to /api/* management endpoints."""
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._send_json({"error": "invalid JSON"}, 400)
+            return
+
+        if path == "/api/sub-ca":
+            cn = data.get("cn", "PyPKI Intermediate CA")
+            validity_days = int(data.get("validity_days", 1825))
+            try:
+                key, cert = self.ca.issue_sub_ca(
+                    cn=cn, validity_days=validity_days, audit=self.audit_log
+                )
+                cert_pem = cert.public_bytes(Encoding.PEM).decode()
+                key_pem = key.private_bytes(Encoding.PEM,
+                                            PrivateFormat.TraditionalOpenSSL,
+                                            NoEncryption()).decode()
+                if self.audit_log:
+                    self.audit_log.record("issue_sub_ca",
+                                          f"cn={cn} serial={cert.serial_number}",
+                                          self.client_address[0])
+                self._send_json({
+                    "ok": True,
+                    "serial": cert.serial_number,
+                    "subject": cert.subject.rfc4514_string(),
+                    "cert_pem": cert_pem,
+                    "key_pem": key_pem,
+                })
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/revoke":
+            serial = data.get("serial")
+            reason = int(data.get("reason", 0))
+            if serial is None:
+                self._send_json({"error": "serial required"}, 400)
+                return
+            ok = self.ca.revoke_certificate(int(serial), reason)
+            if self.audit_log:
+                self.audit_log.record("revoke",
+                                      f"serial={serial} reason={reason}",
+                                      self.client_address[0])
+            self._send_json({"ok": ok, "serial": serial})
+
+        else:
+            self._send_json({"error": "unknown API endpoint"}, 404)
+
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
+        req_path = self.path.split("?")[0].rstrip("/")
+
+        # Management API (POST /api/*)
+        if req_path.startswith("/api/"):
+            self.do_POST_api(req_path, body)
+            return
 
         content_type = self.headers.get("Content-Type", "")
         if content_type not in ("application/pkixcmp", "application/pkixcmp-poll",
@@ -1847,14 +2420,26 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
         if client_cn:
             logger.info(f"Authenticated mTLS client: CN={client_cn}")
 
+        # Rate limiting
+        if self.rate_limiter:
+            ip = self.client_address[0]
+            if not self.rate_limiter.allow(ip):
+                logger.warning(f"Rate limit exceeded for {ip}")
+                self.send_response(429)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Retry-After", "60")
+                rl_body = b"Rate limit exceeded. Try again in 60 seconds."
+                self.send_header("Content-Length", str(len(rl_body)))
+                self.end_headers()
+                self.wfile.write(rl_body)
+                return
+
         # RFC 9480/9811 well-known CMP URI (/.well-known/cmp[/p/<label>])
-        # Strip the well-known prefix for routing; the body is still PKIMessage DER
-        path = self.path.split("?")[0]
-        if path.startswith(CMP_WELL_KNOWN_PATH):
-            label = self._extract_cmp_label(path)
+        cmp_path = self.path.split("?")[0]
+        if cmp_path.startswith(CMP_WELL_KNOWN_PATH):
+            label = self._extract_cmp_label(cmp_path)
             if label:
                 logger.info(f"CMP well-known URI — CA label: {label!r}")
-            # fall through to normal DER handling
 
         try:
             response_der = self.cmp_handler.handle(body)
@@ -1875,7 +2460,6 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
         /.well-known/cmp/p/<label>/...  → label
         /.well-known/cmp/<op>           → None
         """
-        # Remove /.well-known/cmp prefix
         rest = path[len(CMP_WELL_KNOWN_PATH):].lstrip("/")
         parts = rest.split("/")
         if len(parts) >= 2 and parts[0] == "p":
@@ -1994,6 +2578,66 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                 "ca_serial": self.ca.ca_cert.serial_number,
             })
 
+        elif path == "/ca/delta-crl":
+            try:
+                data = self.ca.generate_delta_crl()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/pkix-crl")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path.startswith("/api/certs/") and path.endswith("/p12"):
+            # GET /api/certs/<serial>/p12
+            try:
+                serial = int(path.split("/")[3])
+                p12 = self.ca.export_pkcs12(serial)
+                if p12 is None:
+                    self._send_json({"error": "certificate not found"}, 404)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-pkcs12")
+                    self.send_header("Content-Disposition",
+                                     f'attachment; filename="cert-{serial}.p12"')
+                    self.send_header("Content-Length", str(len(p12)))
+                    self.end_headers()
+                    self.wfile.write(p12)
+            except (ValueError, IndexError):
+                self._send_json({"error": "invalid serial"}, 400)
+
+        elif path.startswith("/api/certs/") and path.endswith("/pem"):
+            try:
+                serial = int(path.split("/")[3])
+                der = self.ca.get_cert_by_serial(serial)
+                if not der:
+                    self._send_json({"error": "certificate not found"}, 404)
+                else:
+                    pem = x509.load_der_x509_certificate(der).public_bytes(Encoding.PEM)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-pem-file")
+                    self.send_header("Content-Disposition",
+                                     f'attachment; filename="cert-{serial}.pem"')
+                    self.send_header("Content-Length", str(len(pem)))
+                    self.end_headers()
+                    self.wfile.write(pem)
+            except (ValueError, IndexError):
+                self._send_json({"error": "invalid serial"}, 400)
+
+        elif path == "/api/audit":
+            if self.audit_log:
+                self._send_json({"events": self.audit_log.recent(200)})
+            else:
+                self._send_json({"events": []})
+
+        elif path == "/api/rate-limit":
+            if self.rate_limiter:
+                ip = self.client_address[0]
+                self._send_json(self.rate_limiter.status(ip))
+            else:
+                self._send_json({"rate_limiting": "disabled"})
+
         elif path.startswith(CMP_WELL_KNOWN_PATH):
             # RFC 9811: GET /.well-known/cmp -> return CA certificate
             label = self._extract_cmp_label(path)
@@ -2017,7 +2661,14 @@ class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
                     "GET /ca/cert.pem": "CA certificate (PEM)",
                     "GET /ca/cert.der": "CA certificate (DER)",
                     "GET /ca/crl": "Certificate Revocation List (DER)",
+                    "GET /ca/delta-crl": "Delta CRL (RFC 5280 §5.2.4)",
                     "GET /api/certs": "List issued certificates (JSON)",
+                    "GET /api/certs/<serial>/pem": "Download certificate as PEM",
+                    "GET /api/certs/<serial>/p12": "Download certificate as PKCS#12 bundle",
+                    "POST /api/sub-ca": "Issue subordinate CA certificate",
+                    "POST /api/revoke": "Revoke certificate {serial, reason}",
+                    "GET /api/audit": "Structured audit log (last 200 events)",
+                    "GET /api/rate-limit": "Rate limit status for calling IP",
                     "GET /api/whoami": "Show authenticated mTLS client identity",
                     "GET /bootstrap?cn=<n>": "Issue client cert bundle (bootstrap port only)",
                     "GET /health": "Health check",
@@ -2067,20 +2718,28 @@ MTLSServer = TLSServer
 # CLI / Main
 # ---------------------------------------------------------------------------
 
-def make_handler(ca: CertificateAuthority, cmp_handler: CMPv2Handler):
+def make_handler(ca: CertificateAuthority, cmp_handler: CMPv2Handler,
+                 audit_log: Optional[AuditLog] = None,
+                 rate_limiter: Optional[RateLimiter] = None):
     class BoundHandler(CMPv2HTTPHandler):
         pass
     BoundHandler.ca = ca
     BoundHandler.cmp_handler = cmp_handler
+    BoundHandler.audit_log = audit_log
+    BoundHandler.rate_limiter = rate_limiter
     return BoundHandler
 
 
-def make_cmpv3_handler(ca: CertificateAuthority, cmp_handler: CMPv3Handler):
+def make_cmpv3_handler(ca: CertificateAuthority, cmp_handler: CMPv3Handler,
+                       audit_log: Optional[AuditLog] = None,
+                       rate_limiter: Optional[RateLimiter] = None):
     """Make an HTTP handler that uses CMPv3Handler (with well-known URI support)."""
     class BoundHandler(CMPv2HTTPHandler):
         pass
     BoundHandler.ca = ca
     BoundHandler.cmp_handler = cmp_handler
+    BoundHandler.audit_log = audit_log
+    BoundHandler.rate_limiter = rate_limiter
     return BoundHandler
 
 
@@ -2180,6 +2839,60 @@ def main():
         "--acme-auto-approve-dns", action="store_true",
         help="Auto-approve dns-01 challenges without DNS lookup (testing/internal CA only)"
     )
+    acme_group.add_argument(
+        "--acme-cert-days", type=int, default=90, metavar="DAYS",
+        help="Validity period for ACME-issued certificates in days (default: 90)"
+    )
+    acme_group.add_argument(
+        "--acme-short-lived-threshold", type=int, default=7, metavar="DAYS",
+        help="Certs with validity <= this receive RFC 9608 id-ce-noRevAvail and "
+             "have CDP/AIA-OCSP suppressed (default: 7)"
+    )
+
+    infra_group = parser.add_argument_group(
+        "Revocation & PKI infrastructure",
+    )
+    infra_group.add_argument(
+        "--ocsp-port", type=int, default=None, metavar="PORT",
+        help="Start OCSP responder on this port (e.g. 8082)"
+    )
+    infra_group.add_argument(
+        "--ocsp-url", default="", metavar="URL",
+        help="Public OCSP URL to embed in AIA extension of all issued certs "
+             "(e.g. http://pki.internal:8082/ocsp)"
+    )
+    infra_group.add_argument(
+        "--crl-url", default="", metavar="URL",
+        help="Public CRL URL to embed in CDP extension of all issued certs "
+             "(e.g. http://pki.internal:8080/ca/crl)"
+    )
+    infra_group.add_argument(
+        "--ocsp-cache-seconds", type=int, default=300,
+        help="OCSP response cache TTL in seconds (default: 300)"
+    )
+
+    ops_group = parser.add_argument_group("Operational options")
+    ops_group.add_argument(
+        "--web-port", type=int, default=None, metavar="PORT",
+        help="Start web dashboard on this port (e.g. 8090)"
+    )
+    ops_group.add_argument(
+        "--rate-limit", type=int, default=0, metavar="N",
+        help="Max certificate requests per IP per minute (0 = disabled)"
+    )
+    ops_group.add_argument(
+        "--audit", action="store_true", default=True,
+        help="Enable structured audit log in ca/audit.db (default: on)"
+    )
+    ops_group.add_argument(
+        "--no-audit", dest="audit", action="store_false",
+        help="Disable audit log"
+    )
+    ops_group.add_argument(
+        "--default-profile", default="default",
+        choices=list(CertProfile.PROFILES.keys()),
+        help="Default certificate profile for CMPv2 issuance (default: default)"
+    )
 
     cmpv3_group = parser.add_argument_group(
         "CMPv3 options (RFC 9480)",
@@ -2264,16 +2977,31 @@ def main():
     ca_dir.mkdir(parents=True, exist_ok=True)
     config = ServerConfig(ca_dir=ca_dir, cli_overrides=cli_overrides)
 
-    ca = CertificateAuthority(ca_dir=args.ca_dir, config=config)
+    # Audit log
+    audit_log = AuditLog(ca_dir) if getattr(args, "audit", True) else None
+
+    # Rate limiter
+    rate_limit_n = getattr(args, "rate_limit", 0)
+    rate_limiter = RateLimiter(max_per_minute=rate_limit_n) if rate_limit_n > 0 else None
+
+    # OCSP / CRL URLs to embed in issued certs
+    ocsp_url = getattr(args, "ocsp_url", "")
+    crl_url  = getattr(args, "crl_url", "")
+
+    ca = CertificateAuthority(ca_dir=args.ca_dir, config=config,
+                               ocsp_url=ocsp_url, crl_url=crl_url)
+
+    if audit_log:
+        audit_log.record("startup", f"port={args.port} tls={'mtls' if args.mtls else 'tls' if args.tls else 'none'}")
 
     # Use CMPv3Handler (RFC 9480) by default; fall back to CMPv2Handler if --no-cmpv3
     if getattr(args, "cmpv3", True):
         cmp_handler = CMPv3Handler(ca)
-        handler_class = make_cmpv3_handler(ca, cmp_handler)
+        handler_class = make_cmpv3_handler(ca, cmp_handler, audit_log, rate_limiter)
         logger.info("CMPv3 handler active (RFC 9480 — pvno auto-negotiation, well-known URI)")
     else:
         cmp_handler = CMPv2Handler(ca)
-        handler_class = make_handler(ca, cmp_handler)
+        handler_class = make_handler(ca, cmp_handler, audit_log, rate_limiter)
         logger.info("CMPv2 handler active (--no-cmpv3 specified)")
 
     scheme = "http"
@@ -2343,6 +3071,8 @@ def main():
                 ca_dir=ca_dir,
                 auto_approve_dns=args.acme_auto_approve_dns,
                 base_url=acme_base,
+                cert_validity_days=getattr(args, "acme_cert_days", 90),
+                short_lived_threshold_days=getattr(args, "acme_short_lived_threshold", 7),
             )
 
     # Start SCEP server if requested
@@ -2382,10 +3112,50 @@ def main():
                 tls_key_path=args.est_tls_key,
             )
 
+    # Start OCSP responder if requested
+    ocsp_srv = None
+    if getattr(args, "ocsp_port", None):
+        if not HAS_OCSP:
+            print("WARNING: ocsp_server.py not found — OCSP support disabled.")
+        else:
+            ocsp_srv = _ocsp_module.start_ocsp_server(
+                host=args.host,
+                port=args.ocsp_port,
+                ca=ca,
+                cache_seconds=getattr(args, "ocsp_cache_seconds", 300),
+            )
+
+    # Start Web UI if requested
+    web_srv = None
+    if getattr(args, "web_port", None):
+        if not HAS_WEBUI:
+            print("WARNING: web_ui.py not found — Web UI disabled.")
+        else:
+            _ocsp_base = f"http://{args.host}:{args.ocsp_port}" if getattr(args, "ocsp_port", None) else ""
+            _acme_base2 = f"http://{args.host}:{args.acme_port}/acme/directory" if getattr(args, "acme_port", None) else ""
+            _scep_base = f"http://{args.host}:{args.scep_port}/scep" if getattr(args, "scep_port", None) else ""
+            _est_base  = f"https://{args.host}:{args.est_port}/.well-known/est" if getattr(args, "est_port", None) else ""
+            web_srv = _web_ui_module.start_web_ui(
+                host=args.host,
+                port=args.web_port,
+                ca=ca,
+                audit_log=audit_log,
+                rate_limiter=rate_limiter,
+                cmp_base_url=f"{scheme}://{args.host}:{args.port}",
+                acme_base_url=_acme_base2,
+                scep_base_url=_scep_base,
+                est_base_url=_est_base,
+                ocsp_base_url=_ocsp_base,
+            )
+
     acme_line = f"http://{args.host}:{args.acme_port}/acme/directory" if (args.acme_port and HAS_ACME) else "disabled"
     scep_line = f"http://{args.host}:{args.scep_port}/scep" if (args.scep_port and HAS_SCEP) else "disabled"
     est_line  = f"https://{args.host}:{args.est_port}/.well-known/est" if (args.est_port and HAS_EST) else "disabled"
+    ocsp_line = f"http://{args.host}:{args.ocsp_port}/ocsp" if (getattr(args,"ocsp_port",None) and HAS_OCSP) else "disabled"
+    web_line  = f"http://{args.host}:{args.web_port}" if getattr(args,"web_port",None) else "disabled"
     cmp_wk    = f"{scheme}://{args.host}:{args.port}/.well-known/cmp"
+    rl_info   = f"{args.rate_limit}/min per IP" if getattr(args,"rate_limit",0) > 0 else "disabled"
+    audit_info = "ca/audit.db" if getattr(args,"audit",True) else "disabled"
     boot_line = f"http://{args.host}:{args.bootstrap_port}/bootstrap?cn=<n>" if args.bootstrap_port else "disabled"
 
     print(f"""
@@ -2399,7 +3169,11 @@ def main():
 ║  Bootstrap        : {boot_line:<47}║
 ║  Listening (SCEP) : {scep_line:<47}║
 ║  Listening (EST)  : {est_line:<47}║
+║  Listening (OCSP) : {ocsp_line:<47}║
+║  Web Dashboard    : {web_line:<47}║
 ║  CMP Well-Known   : {cmp_wk:<47}║
+║  Rate Limiting    : {rl_info:<47}║
+║  Audit Log        : {audit_info:<47}║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Validity periods (change live: PATCH /config)                  ║
 ║    End-entity   : {config.end_entity_days:<3} days                                       ║
@@ -2421,8 +3195,9 @@ def main():
 ║    genm GetCACerts, GetRootCACertUpdate, GetCertReqTemplate     ║
 ║    Well-known URI: POST/GET /.well-known/cmp[/p/<label>]        ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Supported ACME operations (RFC 8555):                         ║
+║  Supported ACME operations (RFC 8555 + RFC 9608):              ║
 ║    new-account, new-order, http-01, dns-01, finalize, revoke   ║
+║    noRevAvail (RFC 9608) auto-applied to short-lived certs     ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Supported SCEP operations (RFC 8894):                          ║
 ║    GetCACaps, GetCACert, PKCSReq, CertPoll, GetCert, GetCRL    ║
@@ -2483,6 +3258,10 @@ def main():
 
     if 'est_srv' not in dir():
         est_srv = None
+    if 'ocsp_srv' not in dir():
+        ocsp_srv = None
+    if 'web_srv' not in dir():
+        web_srv = None
 
     try:
         server.serve_forever()
@@ -2497,6 +3276,12 @@ def main():
             scep_srv.shutdown()
         if est_srv:
             est_srv.shutdown()
+        if ocsp_srv:
+            ocsp_srv.shutdown()
+        if web_srv:
+            web_srv.shutdown()
+        if audit_log:
+            audit_log.record("shutdown", "graceful shutdown via KeyboardInterrupt")
 
 if __name__ == "__main__":
     main()
