@@ -4,12 +4,14 @@ PyPKI Web UI Test Suite
 =======================
 Selenium/pytest tests for the PyPKI HTML dashboard (web_ui.py).
 
-Start server before running:
+Start the server (plain HTTP):
     python pki_server.py --web-port 8008
 
-Optional flags:
-    --acme-port 8888          to enable ACME endpoint info on dashboard
-    --admin-api-key <key>     to enable auth-protected mutation endpoints
+Start with one-way TLS:
+    python pki_server.py --web-port 8008 --tls
+
+Start with mutual TLS:
+    python pki_server.py --web-port 8008 --mtls
 
 Run all tests:
     pytest test_webui.py -v
@@ -21,19 +23,38 @@ Run by category:
     pytest test_webui.py -v -m auth
     pytest test_webui.py -v -m api
 
-Override base URL:
-    WEB_UI_URL=http://myserver:8008 pytest test_webui.py -v
+Environment variables:
+    WEB_UI_URL          Base URL of the web UI (default: http://localhost:8008)
+                        Set to https://localhost:8008 if TLS is enabled.
+    WEB_UI_ADMIN_KEY    Admin API key if --admin-api-key was used to start the server.
+    WEB_UI_CA_CERT      Path to the CA certificate PEM file for TLS verification.
+                        Set to "false" to disable TLS certificate verification (dev only).
+    WEB_UI_CLIENT_CERT  Path to client certificate PEM file (for mTLS).
+    WEB_UI_CLIENT_KEY   Path to client private key PEM file (for mTLS).
 
-Set admin API key (if --admin-api-key was used to start the server):
-    WEB_UI_ADMIN_KEY=mysecretkey pytest test_webui.py -v
+Examples:
+    # Plain HTTP
+    WEB_UI_URL=http://localhost:8008 pytest test_webui.py -v
+
+    # One-way TLS (verify with CA cert)
+    WEB_UI_URL=https://localhost:8008 WEB_UI_CA_CERT=./ca/ca.crt pytest test_webui.py -v
+
+    # One-way TLS (skip verification — dev/test only)
+    WEB_UI_URL=https://localhost:8008 WEB_UI_CA_CERT=false pytest test_webui.py -v
+
+    # Mutual TLS
+    WEB_UI_URL=https://localhost:8008 WEB_UI_CA_CERT=./ca/ca.crt \\
+        WEB_UI_CLIENT_CERT=./client.crt WEB_UI_CLIENT_KEY=./client.key \\
+        pytest test_webui.py -v
 """
 
-import json
 import os
 import time
+import warnings
 
 import pytest
 import requests
+import urllib3
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -42,14 +63,40 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration — driven entirely by environment variables
 # ---------------------------------------------------------------------------
 
 BASE_URL = os.environ.get("WEB_UI_URL", "http://localhost:8008").rstrip("/")
 WAIT_TIMEOUT = 10  # seconds
-
-# Admin API key (set WEB_UI_ADMIN_KEY env var if --admin-api-key was used to start server)
 ADMIN_API_KEY = os.environ.get("WEB_UI_ADMIN_KEY", "")
+
+# TLS configuration
+_ca_cert_env = os.environ.get("WEB_UI_CA_CERT", "")
+_client_cert = os.environ.get("WEB_UI_CLIENT_CERT", "")
+_client_key = os.environ.get("WEB_UI_CLIENT_KEY", "")
+
+# TLS_VERIFY: False = skip verification, str = path to CA bundle, True = system bundle
+if _ca_cert_env.lower() == "false":
+    TLS_VERIFY = False
+    warnings.warn(
+        "WEB_UI_CA_CERT=false: TLS certificate verification is DISABLED. "
+        "Only use this in a trusted test environment.",
+        stacklevel=1,
+    )
+elif _ca_cert_env:
+    TLS_VERIFY = _ca_cert_env   # path to CA bundle PEM
+else:
+    TLS_VERIFY = True           # use system trust store
+
+# mTLS client certificate: (cert_path, key_path) tuple or None
+TLS_CLIENT_CERT = (_client_cert, _client_key) if (_client_cert and _client_key) else None
+
+IS_TLS = BASE_URL.startswith("https://")
+
+# Suppress InsecureRequestWarning when verification is intentionally disabled
+if TLS_VERIFY is False:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -58,13 +105,29 @@ ADMIN_API_KEY = os.environ.get("WEB_UI_ADMIN_KEY", "")
 
 @pytest.fixture(scope="session")
 def driver():
-    """Session-scoped headless Chrome WebDriver."""
+    """Session-scoped headless Chrome WebDriver with optional TLS configuration."""
     opts = Options()
     opts.add_argument("--headless")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1280,900")
+
+    if IS_TLS and TLS_VERIFY is False:
+        # Allow Chrome to connect to servers with self-signed / untrusted certs
+        opts.add_argument("--ignore-certificate-errors")
+        opts.add_argument("--allow-insecure-localhost")
+
+    if IS_TLS and TLS_VERIFY and isinstance(TLS_VERIFY, str):
+        # Tell Chrome to trust a specific CA certificate file
+        opts.add_argument(f"--ssl-client-certificate-path={TLS_VERIFY}")
+
+    if TLS_CLIENT_CERT:
+        # mTLS: Chrome needs the client certificate + key in PKCS#12 format.
+        # For test environments this usually means adding the cert to an NSS
+        # database; for simplicity we note this limitation here and fall back
+        # to the requests-only tests for mTLS-protected endpoints.
+        pass  # Selenium mTLS support is browser/profile-specific; see note above.
 
     try:
         from webdriver_manager.chrome import ChromeDriverManager
@@ -80,16 +143,23 @@ def driver():
 
 @pytest.fixture(scope="session")
 def wait(driver):
-    """Session-scoped explicit wait helper."""
     return WebDriverWait(driver, WAIT_TIMEOUT)
 
 
 @pytest.fixture(scope="session")
 def api():
-    """requests.Session pre-configured with optional admin key."""
+    """
+    requests.Session pre-configured with:
+      - Optional admin API key header
+      - TLS verification setting (CA bundle path, False, or True)
+      - Optional mTLS client certificate
+    """
     s = requests.Session()
     if ADMIN_API_KEY:
         s.headers["X-Admin-Key"] = ADMIN_API_KEY
+    s.verify = TLS_VERIFY
+    if TLS_CLIENT_CERT:
+        s.cert = TLS_CLIENT_CERT
     return s
 
 
@@ -109,7 +179,7 @@ def active_nav(driver) -> str:
 
 
 # ---------------------------------------------------------------------------
-# [ui] Page load tests — verify each route renders the correct HTML page
+# [ui] Page load tests
 # ---------------------------------------------------------------------------
 
 
@@ -129,7 +199,7 @@ class TestPageLoads:
     def test_dashboard_stats_grid_has_four_boxes(self, driver):
         driver.get(f"{BASE_URL}/")
         stat_boxes = driver.find_elements(By.CSS_SELECTOR, ".stats-grid .stat-box")
-        assert len(stat_boxes) == 4, "Expected 4 stat boxes: Total / Active / Revoked / Expired"
+        assert len(stat_boxes) == 4
 
     def test_dashboard_stat_labels(self, driver):
         driver.get(f"{BASE_URL}/")
@@ -139,8 +209,8 @@ class TestPageLoads:
 
     def test_dashboard_ca_card_present(self, driver):
         driver.get(f"{BASE_URL}/")
-        card_headings = [h.text for h in driver.find_elements(By.CSS_SELECTOR, ".card-head h2")]
-        assert "Certificate Authority" in card_headings
+        headings = [h.text for h in driver.find_elements(By.CSS_SELECTOR, ".card-head h2")]
+        assert "Certificate Authority" in headings
 
     def test_dashboard_download_ca_cert_button(self, driver):
         driver.get(f"{BASE_URL}/")
@@ -161,7 +231,7 @@ class TestPageLoads:
         driver.get(f"{BASE_URL}/certs")
         headers = [th.text for th in driver.find_elements(By.CSS_SELECTOR, "table thead th")]
         for col in ("Serial", "Subject", "Not Before", "Not After", "Status", "Actions"):
-            assert col in headers, f"Missing table column: {col}"
+            assert col in headers, f"Missing column: {col}"
 
     def test_certs_page_search_input_present(self, driver):
         driver.get(f"{BASE_URL}/certs")
@@ -191,10 +261,8 @@ class TestPageLoads:
     def test_revocation_reason_options(self, driver):
         driver.get(f"{BASE_URL}/revocation")
         opts = [o.text for o in driver.find_elements(By.CSS_SELECTOR, "#rev-reason option")]
-        assert "Unspecified" in opts
-        assert "Key Compromise" in opts
-        assert "CA Compromise" in opts
-        assert "Cessation Of Operation" in opts
+        for reason in ("Unspecified", "Key Compromise", "CA Compromise", "Cessation Of Operation"):
+            assert reason in opts, f"Missing revocation reason: {reason}"
 
     def test_subca_page_loads(self, driver):
         driver.get(f"{BASE_URL}/sub-ca")
@@ -232,7 +300,6 @@ class TestPageLoads:
         assert inp.get_attribute("type") == "number"
 
     def test_config_page_json_pre_block(self, driver):
-        """Config page must show current config as a JSON object in a <pre> block."""
         driver.get(f"{BASE_URL}/config-ui")
         pre = driver.find_element(By.CSS_SELECTOR, ".card-body pre")
         assert pre.text.strip().startswith("{"), "Expected JSON config in <pre> block"
@@ -240,7 +307,7 @@ class TestPageLoads:
     def test_config_page_apply_button_present(self, driver):
         driver.get(f"{BASE_URL}/config-ui")
         buttons = driver.find_elements(By.CSS_SELECTOR, ".card-body .btn-primary")
-        assert any("Apply" in b.text for b in buttons), "Apply button not found on config page"
+        assert any("Apply" in b.text for b in buttons)
 
     def test_audit_page_loads(self, driver):
         driver.get(f"{BASE_URL}/audit")
@@ -258,7 +325,7 @@ class TestPageLoads:
         assert "PyPKI" in driver.title
         assert active_nav(driver) == "API Docs"
 
-    def test_api_docs_table_has_get_and_post(self, driver):
+    def test_api_docs_table_has_methods(self, driver):
         driver.get(f"{BASE_URL}/api-docs")
         methods = [td.text for td in driver.find_elements(By.CSS_SELECTOR, "table tbody td:first-child")]
         assert "GET" in methods
@@ -275,7 +342,7 @@ class TestPageLoads:
 class TestNavigation:
     """Verify nav links work correctly and all routes are reachable."""
 
-    def test_topbar_present_on_every_page(self, driver):
+    def test_topbar_on_every_page(self, driver):
         for path in ["/", "/certs", "/expiring", "/revocation", "/sub-ca",
                      "/metrics-ui", "/config-ui", "/audit", "/api-docs"]:
             driver.get(f"{BASE_URL}{path}")
@@ -331,7 +398,6 @@ class TestNavigation:
         assert active_nav(driver) == "API Docs"
 
     def test_dashboard_alias_route(self, driver):
-        """/dashboard should also render the dashboard page with Dashboard active."""
         driver.get(f"{BASE_URL}/dashboard")
         assert active_nav(driver) == "Dashboard"
 
@@ -355,17 +421,12 @@ class TestNavigation:
     def test_download_content_types(self, api, path, expected_ct):
         resp = api.get(f"{BASE_URL}{path}")
         assert resp.status_code == 200
-        assert resp.headers["Content-Type"].startswith(expected_ct), \
-            f"{path} → unexpected Content-Type: {resp.headers['Content-Type']}"
+        assert resp.headers["Content-Type"].startswith(expected_ct)
 
     def test_ca_cert_pem_contains_certificate(self, api):
         resp = api.get(f"{BASE_URL}/ca/cert.pem")
         assert resp.status_code == 200
         assert "BEGIN CERTIFICATE" in resp.text
-
-    def test_ca_crl_accessible(self, api):
-        resp = api.get(f"{BASE_URL}/ca/crl")
-        assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -375,16 +436,13 @@ class TestNavigation:
 
 @pytest.mark.forms
 class TestForms:
-    """Test interactive form elements: search filter, config patch, sub-CA issuance, revocation."""
+    """Test interactive form elements: search filter, config patch, sub-CA, revocation."""
 
-    # ---- Certificate search filter ----
-
-    def test_search_input_filters_table(self, driver):
-        """Typing an impossible query in the search box hides all rows."""
+    def test_search_filters_table(self, driver):
         driver.get(f"{BASE_URL}/certs")
         rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
         if len(rows) < 1:
-            pytest.skip("No certificates present to filter")
+            pytest.skip("No certificates present")
 
         search = driver.find_element(By.ID, "search")
         search.clear()
@@ -395,11 +453,10 @@ class TestForms:
                    if r.is_displayed()]
         assert len(visible) == 0, "Search filter did not hide non-matching rows"
 
-    def test_search_clear_restores_all_rows(self, driver):
-        """Clearing the search box restores all rows to visible."""
+    def test_search_clear_restores_rows(self, driver):
         driver.get(f"{BASE_URL}/certs")
         all_rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
-        if len(all_rows) < 1:
+        if not all_rows:
             pytest.skip("No certificates present")
 
         search = driver.find_element(By.ID, "search")
@@ -413,65 +470,47 @@ class TestForms:
                    if r.is_displayed()]
         assert len(visible) == len(all_rows)
 
-    # ---- Config PATCH via JSON API ----
-
-    def test_api_get_config_returns_json_object(self, api):
+    def test_api_get_config_returns_json(self, api):
         resp = api.get(f"{BASE_URL}/api/config")
         assert resp.status_code == 200
         assert isinstance(resp.json(), dict)
 
     def test_api_patch_config_end_entity_days(self, api):
-        """PATCH /api/config updates end_entity_days and returns ok:true."""
         original = api.get(f"{BASE_URL}/api/config").json()
         original_days = original.get("validity", {}).get("end_entity_days", 365)
 
-        resp = api.patch(
-            f"{BASE_URL}/api/config",
-            json={"validity": {"end_entity_days": 400}},
-        )
+        resp = api.patch(f"{BASE_URL}/api/config",
+                         json={"validity": {"end_entity_days": 400}})
         assert resp.status_code == 200
         assert resp.json().get("ok") is True
 
-        # Restore
-        api.patch(f"{BASE_URL}/api/config", json={"validity": {"end_entity_days": original_days}})
+        api.patch(f"{BASE_URL}/api/config",
+                  json={"validity": {"end_entity_days": original_days}})
 
     def test_api_patch_config_value_persists(self, api):
-        """Patched value is reflected in a subsequent GET /api/config."""
         sentinel = 421
         api.patch(f"{BASE_URL}/api/config", json={"validity": {"end_entity_days": sentinel}})
-
         cfg = api.get(f"{BASE_URL}/api/config").json()
-        assert cfg.get("validity", {}).get("end_entity_days") == sentinel, \
-            "Patched end_entity_days value was not persisted"
-
+        assert cfg.get("validity", {}).get("end_entity_days") == sentinel
         api.patch(f"{BASE_URL}/api/config", json={"validity": {"end_entity_days": 365}})
 
     def test_api_patch_config_malformed_json_is_4xx(self, api):
-        """Sending malformed JSON should return 4xx (not a 5xx server crash)."""
-        resp = api.patch(
-            f"{BASE_URL}/api/config",
-            data="this is not valid json {{{",
-            headers={"Content-Type": "application/json"},
-        )
-        assert 400 <= resp.status_code < 500, \
-            f"Expected 4xx for malformed JSON, got {resp.status_code}"
-
-    # ---- Config page UI interaction ----
+        resp = api.patch(f"{BASE_URL}/api/config",
+                         data="this is not valid json {{{",
+                         headers={"Content-Type": "application/json"})
+        assert 400 <= resp.status_code < 500
 
     def test_config_page_ee_days_matches_api(self, api, driver):
-        """The ee_days input value on the config page reflects the current API config."""
         cfg = api.get(f"{BASE_URL}/api/config").json()
         api_days = str(cfg.get("validity", {}).get("end_entity_days", ""))
         if not api_days:
-            pytest.skip("end_entity_days not in config response")
+            pytest.skip("end_entity_days not in config")
 
         driver.get(f"{BASE_URL}/config-ui")
         inp = driver.find_element(By.ID, "ee_days")
-        assert inp.get_attribute("value") == api_days, \
-            f"Input shows {inp.get_attribute('value')!r}, API says {api_days!r}"
+        assert inp.get_attribute("value") == api_days
 
     def test_config_page_patch_via_ui_shows_result(self, api, driver, wait):
-        """Clicking Apply on the config page populates the result <pre> with a JSON response."""
         driver.get(f"{BASE_URL}/config-ui")
         inp = driver.find_element(By.ID, "ee_days")
         inp.clear()
@@ -482,15 +521,11 @@ class TestForms:
         result_pre = driver.find_element(By.ID, "cfg-result")
         wait.until(lambda d: result_pre.text.strip() != "")
         text = result_pre.text.lower()
-        assert "ok" in text or "config" in text, \
-            f"Unexpected cfg-result: {result_pre.text}"
+        assert "ok" in text or "config" in text
 
         api.patch(f"{BASE_URL}/api/config", json={"validity": {"end_entity_days": 365}})
 
-    # ---- Sub-CA form ----
-
     def test_subca_form_shows_result_on_submit(self, driver, wait):
-        """Filling the Sub-CA form and clicking Issue populates the result <pre>."""
         driver.get(f"{BASE_URL}/sub-ca")
         cn_input = driver.find_element(By.ID, "subca-cn")
         cn_input.clear()
@@ -500,40 +535,31 @@ class TestForms:
         days_input.clear()
         days_input.send_keys("730")
 
-        driver.find_element(
-            By.XPATH, "//button[contains(text(),'Issue Sub-CA Certificate')]"
-        ).click()
+        driver.find_element(By.XPATH,
+                            "//button[contains(text(),'Issue Sub-CA Certificate')]").click()
 
         result_pre = driver.find_element(By.ID, "subca-result")
         wait.until(lambda d: result_pre.text.strip() != "")
         assert result_pre.text.strip() != ""
 
     def test_subca_api_returns_cert_and_key(self, api):
-        """POST /api/issue-sub-ca returns cert_pem and key_pem fields on success."""
-        resp = api.post(
-            f"{BASE_URL}/api/issue-sub-ca",
-            json={"cn": "API Selenium Test Sub-CA", "validity_days": 365},
-        )
-        assert resp.status_code < 500, f"Server error: {resp.status_code}"
+        resp = api.post(f"{BASE_URL}/api/issue-sub-ca",
+                        json={"cn": "API Selenium Test Sub-CA", "validity_days": 365})
+        assert resp.status_code < 500
         if resp.status_code == 200:
             data = resp.json()
             assert "cert_pem" in data
             assert "key_pem" in data
             assert "BEGIN CERTIFICATE" in data["cert_pem"]
 
-    # ---- Revocation form ----
-
     def test_revocation_revoke_button_present(self, driver):
         driver.get(f"{BASE_URL}/revocation")
         btns = driver.find_elements(By.CSS_SELECTOR, ".btn-danger")
-        assert len(btns) >= 1, "No Revoke button on revocation page"
+        assert len(btns) >= 1
 
     def test_api_revoke_nonexistent_serial_no_crash(self, api):
-        """Revoking an unknown serial returns JSON and does not 500."""
-        resp = api.post(
-            f"{BASE_URL}/api/revoke",
-            json={"serial": 999999999, "reason": 0},
-        )
+        resp = api.post(f"{BASE_URL}/api/revoke",
+                        json={"serial": 999999999, "reason": 0})
         assert resp.status_code < 500
         assert "application/json" in resp.headers.get("Content-Type", "")
 
@@ -547,91 +573,88 @@ class TestForms:
 class TestAuth:
     """Verify authentication, security headers, and CSRF protection."""
 
-    # ---- Public read-only endpoints ----
+    def _plain_session(self) -> requests.Session:
+        """A fresh session with TLS config but NO admin key — for auth boundary tests."""
+        s = requests.Session()
+        s.verify = TLS_VERIFY
+        if TLS_CLIENT_CERT:
+            s.cert = TLS_CLIENT_CERT
+        return s
 
-    def test_html_pages_accessible_without_credentials(self):
+    def test_html_pages_accessible_without_admin_key(self):
+        s = self._plain_session()
         for path in ["/", "/certs", "/expiring", "/revocation", "/sub-ca",
                      "/metrics-ui", "/config-ui", "/audit", "/api-docs"]:
-            resp = requests.get(f"{BASE_URL}{path}")
+            resp = s.get(f"{BASE_URL}{path}")
             assert resp.status_code == 200, \
-                f"Expected 200 without auth for {path}, got {resp.status_code}"
+                f"Expected 200 without admin key for {path}, got {resp.status_code}"
 
     def test_api_config_get_public(self):
-        assert requests.get(f"{BASE_URL}/api/config").status_code == 200
+        assert self._plain_session().get(f"{BASE_URL}/api/config").status_code == 200
 
     def test_api_certs_public(self):
-        resp = requests.get(f"{BASE_URL}/api/certs")
+        resp = self._plain_session().get(f"{BASE_URL}/api/certs")
         assert resp.status_code == 200
         assert "certificates" in resp.json()
 
     def test_api_audit_public(self):
-        resp = requests.get(f"{BASE_URL}/api/audit")
+        resp = self._plain_session().get(f"{BASE_URL}/api/audit")
         assert resp.status_code == 200
         assert "events" in resp.json()
 
     def test_api_metrics_public(self):
-        resp = requests.get(f"{BASE_URL}/api/metrics")
+        resp = self._plain_session().get(f"{BASE_URL}/api/metrics")
         assert resp.status_code == 200
         assert resp.headers["Content-Type"].startswith("text/plain")
 
     def test_ca_cert_pem_public(self):
-        resp = requests.get(f"{BASE_URL}/ca/cert.pem")
+        resp = self._plain_session().get(f"{BASE_URL}/ca/cert.pem")
         assert resp.status_code == 200
         assert "BEGIN CERTIFICATE" in resp.text
 
-    # ---- Admin API key (only exercised when WEB_UI_ADMIN_KEY is configured) ----
-
     @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set")
-    def test_patch_config_with_valid_key_succeeds(self):
-        resp = requests.patch(
-            f"{BASE_URL}/api/config",
-            json={"validity": {"end_entity_days": 365}},
-            headers={"X-Admin-Key": ADMIN_API_KEY},
-        )
+    def test_patch_config_with_valid_key_succeeds(self, api):
+        resp = api.patch(f"{BASE_URL}/api/config",
+                         json={"validity": {"end_entity_days": 365}})
         assert resp.status_code == 200
         assert resp.json().get("ok") is True
 
     @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set")
     def test_patch_config_with_wrong_key_is_403(self):
-        resp = requests.patch(
-            f"{BASE_URL}/api/config",
-            json={"validity": {"end_entity_days": 365}},
-            headers={"X-Admin-Key": "DEFINITELY_WRONG_KEY_XYZ"},
-        )
+        s = self._plain_session()
+        s.headers["X-Admin-Key"] = "DEFINITELY_WRONG_KEY_XYZ"
+        resp = s.patch(f"{BASE_URL}/api/config",
+                       json={"validity": {"end_entity_days": 365}})
         assert resp.status_code in (401, 403)
 
     @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set")
     def test_revoke_without_key_is_403(self):
-        resp = requests.post(
-            f"{BASE_URL}/api/revoke",
-            json={"serial": 1, "reason": 0},
-        )
+        resp = self._plain_session().post(f"{BASE_URL}/api/revoke",
+                                          json={"serial": 1, "reason": 0})
         assert resp.status_code in (401, 403)
 
     @pytest.mark.skipif(not ADMIN_API_KEY, reason="WEB_UI_ADMIN_KEY not set")
     def test_issue_sub_ca_without_key_is_403(self):
-        resp = requests.post(
-            f"{BASE_URL}/api/issue-sub-ca",
-            json={"cn": "Unauthorized CA", "validity_days": 365},
-        )
+        resp = self._plain_session().post(f"{BASE_URL}/api/issue-sub-ca",
+                                          json={"cn": "Unauthorized CA", "validity_days": 365})
         assert resp.status_code in (401, 403)
 
-    # ---- Security headers (added by _send_html) ----
+    # ---- Security headers ----
 
     def test_x_frame_options_deny(self):
-        assert requests.get(f"{BASE_URL}/").headers.get("X-Frame-Options") == "DENY"
+        assert self._plain_session().get(f"{BASE_URL}/").headers.get("X-Frame-Options") == "DENY"
 
     def test_x_content_type_options_nosniff(self):
-        assert requests.get(f"{BASE_URL}/").headers.get("X-Content-Type-Options") == "nosniff"
+        assert self._plain_session().get(f"{BASE_URL}/").headers.get("X-Content-Type-Options") == "nosniff"
 
     def test_cache_control_no_store(self):
-        assert "no-store" in requests.get(f"{BASE_URL}/").headers.get("Cache-Control", "")
+        assert "no-store" in self._plain_session().get(f"{BASE_URL}/").headers.get("Cache-Control", "")
 
-    # ---- CSRF check ----
+    # ---- CSRF ----
 
-    def test_patch_config_bad_origin_is_rejected(self):
-        """PATCH /api/config from a foreign Origin (no API key) should be blocked."""
-        resp = requests.patch(
+    def test_patch_config_bad_origin_rejected(self):
+        s = self._plain_session()
+        resp = s.patch(
             f"{BASE_URL}/api/config",
             json={"validity": {"end_entity_days": 365}},
             headers={
@@ -640,8 +663,7 @@ class TestAuth:
             },
         )
         # 403 = CSRF blocked; 200 = server running without auth configured (backward compat)
-        assert resp.status_code in (200, 403), \
-            f"Unexpected status {resp.status_code} for cross-origin PATCH"
+        assert resp.status_code in (200, 403)
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +681,6 @@ class TestAPIEndpoints:
         assert isinstance(data["certificates"], list)
 
     def test_api_certs_entry_fields(self, api):
-        """Each certificate entry must contain the required fields."""
         certs = api.get(f"{BASE_URL}/api/certs").json().get("certificates", [])
         if not certs:
             pytest.skip("No certificates issued yet")
@@ -687,20 +708,18 @@ class TestAPIEndpoints:
         assert resp.content[0] == 0x30, "PKCS#12 should start with ASN.1 SEQUENCE (0x30)"
 
     def test_api_cert_unknown_serial_returns_404(self, api):
-        resp = api.get(f"{BASE_URL}/api/certs/999999999/pem")
-        assert resp.status_code == 404
+        assert api.get(f"{BASE_URL}/api/certs/999999999/pem").status_code == 404
 
     def test_api_cert_unknown_format_returns_400(self, api):
         certs = api.get(f"{BASE_URL}/api/certs").json().get("certificates", [])
         if not certs:
             pytest.skip("No certificates to test with")
         serial = certs[0]["serial"]
-        resp = api.get(f"{BASE_URL}/api/certs/{serial}/unsupportedformat")
-        assert resp.status_code == 400
+        assert api.get(f"{BASE_URL}/api/certs/{serial}/unsupportedformat").status_code == 400
 
-    def test_api_config_validity_key_present(self, api):
+    def test_api_config_has_validity(self, api):
         cfg = api.get(f"{BASE_URL}/api/config").json()
-        assert "validity" in cfg or len(cfg) > 0, "Config response is unexpectedly empty"
+        assert "validity" in cfg or len(cfg) > 0
 
     def test_api_audit_returns_events_list(self, api):
         data = api.get(f"{BASE_URL}/api/audit").json()

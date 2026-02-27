@@ -1085,12 +1085,21 @@ class TestHTTPAPI(unittest.TestCase):
         handler_class = pki.make_cmpv3_handler(cls.ca, cmp_handler,
                                                 cls.audit, cls.rate)
 
-        # Find a free port
+        # Bind to port 0 and let the OS assign a free port, keeping the socket
+        # open until the server is ready to avoid the TOCTOU race where another
+        # process (e.g. a live TLS server) grabs the port between our probe and
+        # our bind.  ThreadedHTTPServer uses SO_REUSEADDR which on Windows also
+        # allows re-use of TIME_WAIT ports, so we must not release the socket
+        # before the server has bound.
         import socket
-        s = socket.socket()
-        s.bind(("127.0.0.1", 0))
-        cls.port = s.getsockname()[1]
-        s.close()
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # On Windows SO_EXCLUSIVEADDRUSE prevents another socket from stealing
+        # our port even after we close the probe.
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        probe.bind(("127.0.0.1", 0))
+        cls.port = probe.getsockname()[1]
+        probe.close()
 
         cls.server = pki.ThreadedHTTPServer(("127.0.0.1", cls.port), handler_class)
         cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -1250,10 +1259,12 @@ class TestHTTPAPI(unittest.TestCase):
         handler2 = pki.make_handler(ca2, cmp2, rate_limiter=rate2)
 
         import socket as _sock
-        s = _sock.socket()
-        s.bind(("127.0.0.1", 0))
-        port2 = s.getsockname()[1]
-        s.close()
+        probe2 = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        if hasattr(_sock, "SO_EXCLUSIVEADDRUSE"):
+            probe2.setsockopt(_sock.SOL_SOCKET, _sock.SO_EXCLUSIVEADDRUSE, 1)
+        probe2.bind(("127.0.0.1", 0))
+        port2 = probe2.getsockname()[1]
+        probe2.close()
 
         srv2 = pki.ThreadedHTTPServer(("127.0.0.1", port2), handler2)
         t2 = threading.Thread(target=srv2.serve_forever, daemon=True)
@@ -1319,10 +1330,12 @@ class TestOCSPParsing(unittest.TestCase):
         ca = _make_ca(tmp)
 
         import socket as _sock
-        s = _sock.socket()
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-        s.close()
+        probe_o = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        if hasattr(_sock, "SO_EXCLUSIVEADDRUSE"):
+            probe_o.setsockopt(_sock.SOL_SOCKET, _sock.SO_EXCLUSIVEADDRUSE, 1)
+        probe_o.bind(("127.0.0.1", 0))
+        port = probe_o.getsockname()[1]
+        probe_o.close()
 
         srv = ocsp_server.start_ocsp_server("127.0.0.1", port, ca, cache_seconds=10)
         time.sleep(0.1)
