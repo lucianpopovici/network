@@ -26,7 +26,8 @@ A self-contained, production-grade private Certificate Authority with support fo
 | [`est_server.py`](#est-server) | EST server module (RFC 7030) |
 | [`ocsp_server.py`](#ocsp-responder) | OCSP responder (RFC 6960 / RFC 5019) |
 | [`web_ui.py`](#web-dashboard) | HTML management dashboard |
-| [`test_pki_server.py`](#testing) | Unit + RFC compliance test suite (241 tests) |
+| [`service_manager.py`](#service-management) | Live service lifecycle manager (start / stop / restart) |
+| [`test_pki_server.py`](#testing) | Unit + RFC compliance test suite (282 tests) |
 | [`ca_import/`](#ansible-ca-import-role) | Ansible role to push the CA cert to client machines |
 | [`CHANGELOG.md`](CHANGELOG.md) | Full version history |
 | [`LICENSE`](LICENSE) | MIT License |
@@ -56,6 +57,7 @@ A self-contained, production-grade private Certificate Authority with support fo
 - Certificate Transparency: submit to CT logs and embed SCTs (`SignedCertificateTimestampList`)
 - ACME `dns-01` production hooks: RFC 2136 Dynamic DNS and generic webhook
 - OpenTelemetry tracing with no-op fallback (zero dependencies without `opentelemetry` installed)
+- Live service lifecycle management — start, stop, restart any sub-service from the Web UI without affecting others
 
 ### CMPv2 / CMPv3 Protocol (RFC 4210 / RFC 6712 / RFC 9480)
 | Operation | Type | Description |
@@ -716,6 +718,7 @@ Pages:
 | Expiring | `/expiring` | Certs expiring within 30 days, one-click renew button |
 | Revocation | `/revocation` | CRL/OCSP URLs, revoke-by-serial form with reason |
 | Sub-CA | `/sub-ca` | Issue intermediate CA certificates |
+| **Services** | **`/services`** | **Start, stop, restart each sub-service; per-service config forms; live status** |
 | Metrics | `/metrics-ui` | Rendered Prometheus metrics; link to raw `/api/metrics` scrape endpoint |
 | Config | `/config-ui` | Live config viewer + validity period editor |
 | Audit Log | `/audit` | Last 100 audit events |
@@ -735,10 +738,76 @@ REST API exposed by the dashboard (also consumable directly):
 | `PATCH` | `/api/config` | Update validity periods — body: `{"validity": {...}}` 🔒 |
 | `POST` | `/api/issue-sub-ca` | Issue sub-CA cert — body: `{"cn": "...", "validity_days": N}` 🔒 |
 | `GET` | `/api/audit` | Audit log — last 200 events (JSON) |
+| `GET` | `/api/services` | Status of all services (JSON) |
+| `POST` | `/api/services/<n>/start` | Start a service |
+| `POST` | `/api/services/<n>/stop` | Stop a service |
+| `POST` | `/api/services/<n>/restart` | Restart a service |
+| `PATCH` | `/api/services/<n>/config` | Update service config and restart it |
 | `GET` | `/ca/cert.pem` | CA certificate (PEM, for trust store import) |
 | `GET` | `/ca/crl` | Certificate Revocation List (DER) |
 
 ---
+
+---
+
+## Service Management
+
+`service_manager.py` lets you start, stop, and restart any sub-service from the **Web UI `/services` page** or via REST API — without restarting the main process or touching the command line.
+
+### How it works
+
+Each service (ACME, SCEP, EST, OCSP) is registered with a factory callable and a startup config dict. The `ServiceManager` stores the live server object returned by the factory and calls `.shutdown()` on stop. The CMP main server is registered as *unmanaged* — it shows in the UI as `Running` but cannot be stopped (stopping it would kill the Web UI itself).
+
+Config changes saved from the UI restart **only the affected service**. Editing `ca/config.json` directly on disk restarts **all** services (detected by a background mtime-polling watcher).
+
+### Services page
+
+```
+http://localhost:8090/services
+```
+
+Each service card shows:
+- Animated status dot (green = running, grey = stopped, amber = starting, red = error)
+- **Start / Stop / Restart** buttons (disabled when not applicable)
+- Collapsible **⚙ Configuration** form with type-appropriate inputs
+- **Save & Restart** — applies config changes and restarts only that service
+- Status auto-refreshes every 5 seconds
+
+### REST API
+
+```bash
+# View all service statuses
+curl http://localhost:8090/api/services
+
+# Stop the SCEP server
+curl -X POST http://localhost:8090/api/services/scep/stop
+
+# Change OCSP cache TTL and restart only the OCSP responder
+curl -X PATCH http://localhost:8090/api/services/ocsp/config \
+  -H 'Content-Type: application/json' \
+  -d '{"cache_seconds": 600}'
+
+# Restart the ACME server
+curl -X POST http://localhost:8090/api/services/acme/restart
+```
+
+### Service names
+
+| Name | Service |
+|---|---|
+| `cmp` | CMPv2/v3 main server (unmanaged — shown but cannot be stopped) |
+| `acme` | ACME server |
+| `scep` | SCEP server |
+| `est` | EST server |
+| `ocsp` | OCSP responder |
+
+### Config-file watcher
+
+When `ca/config.json` is edited directly on disk, the watcher (polling every 2 seconds) detects the mtime change and restarts all managed services automatically, picking up the new settings.
+
+### Optional dependency
+
+`service_manager.py` must be present in the same directory as `pki_server.py`. If it is missing, the server starts normally and all service management features are silently unavailable (the Web UI Services page shows an informational message).
 
 ---
 
@@ -1153,10 +1222,10 @@ Spans are emitted for: `issue_certificate`, `revoke_certificate`, `generate_crl`
 ## Testing
 
 PyPKI ships a comprehensive test suite covering RFC compliance, all public APIs,
-and integration behaviour. The suite contains **241 tests across 33 test classes**.
+and integration behaviour. The suite contains **282 tests across 35 test classes**.
 
 ```bash
-# Run all 241 tests
+# Run all 282 tests
 python -m unittest test_pki_server -v
 
 # Run only RFC compliance tests
@@ -1173,6 +1242,10 @@ python -m unittest test_pki_server.TestCertificateRenewal -v
 python -m unittest test_pki_server.TestOCSPStapling -v
 python -m unittest test_pki_server.TestCertificateTransparency -v
 
+# Run service management tests
+python -m unittest test_pki_server.TestServiceManager -v
+python -m unittest test_pki_server.TestWebUIServicesPage -v
+
 # Run HTTP API integration tests
 python -m unittest test_pki_server.TestHTTPAPI -v
 
@@ -1181,6 +1254,7 @@ pytest test_pki_server.py -v -k rfc5280
 pytest test_pki_server.py -v -k rfc9608
 pytest test_pki_server.py -v -k rfc9549
 pytest test_pki_server.py -v -k policies
+pytest test_pki_server.py -v -k service
 ```
 
 ### Test classes
@@ -1207,10 +1281,25 @@ pytest test_pki_server.py -v -k policies
 | `TestModuleStructure` | 5 | All exported symbols, all 8 profiles, noRevAvail OID |
 | `TestRFC9549IDNA` | 13 | DNS U-label→A-label, wildcard preserved, ASCII email, IDN-host email A-label, SmtpUTF8Mailbox OID/tag/payload, mixed list, DC attribute IDNA |
 | `TestCertificatePolicies` | 17 | Not added by default, single/multi OID, non-critical, CPS URI, UserNotice text, UTF-8 round-trip, both qualifiers, CA/B Forum OID constants, bad-oid skipped, empty list, profile default, explicit override |
+| `TestDatetimeTimezoneAwareness` | 4 | All datetime calls are timezone-aware |
+| `TestRandomCASerial` | 3 | Root CA serial is random (RFC 5280 §4.1.2.2) |
+| `TestKeyArchival` | 7 | Archive + recover, AES-256-CBC, wrong password rejected, unknown serial |
+| `TestNameConstraints` | 5 | Extension present and critical, permitted DNS/IP subtrees, CA cert flag |
+| `TestExpiryMonitor` | 5 | expiring_certificates(), revoked certs excluded, monitor daemon thread |
+| `TestCertificateRenewal` | 9 | New serial, preserved subject/SANs/key, fresh validity, unknown serial |
+| `TestPrometheusMetrics` | 9 | Dict shape, counter increments, prometheus text format, HTTP endpoint |
+| `TestCertFilterEndpoint` | 8 | Filter by profile, expiry window, /api/expiring endpoint |
+| `TestTLS13Only` | 5 | TLSv1.3 minimum and maximum versions set, default allows TLS 1.2 |
+| `TestOCSPStapling` | 6 | Cache hit/miss, TTL, invalidate on revocation, bad URL graceful |
+| `TestCertificateTransparency` | 7 | Bad URL returns None, SCT extension OID and criticality, embed_scts |
+| `TestDNS01Hooks` | 5 | Webhook factory, failure handling, RFC 2136 hook without dnspython |
+| `TestOpenTelemetryNoOp` | 4 | No-op tracer, span context manager, issue_certificate with no SDK |
+| `TestServiceManager` | 26 | Lifecycle (start/stop/restart), unmanaged services, config patching, selective restarts, config-file watcher, schema validation |
+| `TestWebUIServicesPage` | 15 | Live HTTP — /services page, /api/services JSON, start/stop/restart/config-patch endpoints, CMP unmanaged refusal |
 
 ### Dependencies
 
-Tests use only the Python standard library (`unittest`, `http.client`, `tempfile`, `threading`)
+Tests use only the Python standard library (`unittest`, `http.client`, `socket`, `tempfile`, `threading`)
 plus `cryptography` (already required). No additional test framework is needed.
 
 ---
@@ -1234,7 +1323,7 @@ ca/
 ├── crl_base            Delta CRL base snapshots stored in certificates.db
 
 Project root:
-├── test_pki_server.py  Unit + RFC compliance test suite (241 tests)
+├── test_pki_server.py  Unit + RFC compliance test suite (282 tests)
 ├── est/                EST TLS cert auto-issued here (if no --est-tls-cert)
 ├── config.json         Live server configuration (hot-reloaded)
 ├── server.crt          Auto-issued TLS server certificate

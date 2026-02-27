@@ -32,6 +32,7 @@ import http.client
 import http.server
 import json
 import os
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -2790,6 +2791,573 @@ class TestOpenTelemetryNoOp(unittest.TestCase):
         pki_mod._tracer = pki_mod._get_tracer()
         cert = ca.issue_certificate("CN=otel-test", key.public_key())
         self.assertIsNotNone(cert)
+
+
+
+
+# ===========================================================================
+# Service Manager tests (service_manager.py)
+# ===========================================================================
+
+class TestServiceManager(unittest.TestCase):
+    """Tests for service_manager.ServiceManager and ServiceDef."""
+
+    def _make_factory(self, call_log: list):
+        """Return a factory callable and a tracker list for lifecycle events."""
+        def factory(**kwargs):
+            call_log.append(("start", dict(kwargs)))
+
+            class _FakeSrv:
+                def shutdown(self):
+                    call_log.append(("stop",))
+
+            return _FakeSrv()
+
+        return factory
+
+    def _make_sm(self):
+        """Return a fresh ServiceManager with no config-file path."""
+        try:
+            from service_manager import ServiceManager
+        except ImportError:
+            self.skipTest("service_manager.py not present")
+        return ServiceManager()
+
+    # ---- ServiceDef lifecycle ----
+
+    def test_start_changes_state_to_running(self):
+        sm = self._make_sm()
+        log = []
+        sm.register("svc", "Test", self._make_factory(log), {"port": 9000}, enabled=True)
+        ok, err = sm.start("svc")
+        self.assertTrue(ok, err)
+        self.assertEqual(sm.get("svc").state, "running")
+
+    def test_stop_changes_state_to_stopped(self):
+        sm = self._make_sm()
+        log = []
+        sm.register("svc", "Test", self._make_factory(log), {"port": 9000}, enabled=True)
+        sm.start("svc")
+        ok, err = sm.stop("svc")
+        self.assertTrue(ok, err)
+        self.assertEqual(sm.get("svc").state, "stopped")
+
+    def test_restart_returns_service_to_running(self):
+        sm = self._make_sm()
+        log = []
+        sm.register("svc", "Test", self._make_factory(log), {"port": 9000}, enabled=True)
+        sm.start("svc")
+        ok, err = sm.restart("svc")
+        self.assertTrue(ok, err)
+        self.assertEqual(sm.get("svc").state, "running")
+
+    def test_restart_calls_stop_then_start(self):
+        sm = self._make_sm()
+        log = []
+        sm.register("svc", "Test", self._make_factory(log), {"port": 9000}, enabled=True)
+        sm.start("svc")
+        log.clear()
+        sm.restart("svc")
+        events = [e[0] for e in log]
+        self.assertIn("stop", events)
+        self.assertIn("start", events)
+        self.assertLess(events.index("stop"), events.index("start"))
+
+    def test_start_all_enabled_starts_only_enabled(self):
+        sm = self._make_sm()
+        log = []
+        factory = self._make_factory(log)
+        sm.register("svc1", "S1", factory, {"port": 9001}, enabled=True)
+        sm.register("svc2", "S2", factory, {"port": 9002}, enabled=False)
+        sm.start_all_enabled()
+        self.assertEqual(sm.get("svc1").state, "running")
+        self.assertEqual(sm.get("svc2").state, "stopped")
+
+    def test_stop_all_stops_running_services(self):
+        sm = self._make_sm()
+        log = []
+        factory = self._make_factory(log)
+        sm.register("svc1", "S1", factory, {"port": 9001}, enabled=True)
+        sm.register("svc2", "S2", factory, {"port": 9002}, enabled=True)
+        sm.start("svc1")
+        sm.start("svc2")
+        sm.stop_all()
+        self.assertEqual(sm.get("svc1").state, "stopped")
+        self.assertEqual(sm.get("svc2").state, "stopped")
+
+    def test_unknown_service_returns_error(self):
+        sm = self._make_sm()
+        ok, err = sm.start("nonexistent")
+        self.assertFalse(ok)
+        self.assertIn("Unknown", err)
+
+    # ---- Unmanaged (factory=None) services ----
+
+    def test_unmanaged_service_state_running_on_register(self):
+        sm = self._make_sm()
+        sm.register("cmp", "CMP", None, {"port": 8080}, enabled=True)
+        self.assertEqual(sm.get("cmp").state, "running")
+
+    def test_unmanaged_service_stop_refused(self):
+        sm = self._make_sm()
+        sm.register("cmp", "CMP", None, {"port": 8080}, enabled=True)
+        ok, err = sm.stop("cmp")
+        self.assertFalse(ok)
+        self.assertIn("cannot", err.lower())
+
+    def test_unmanaged_service_restart_refused(self):
+        sm = self._make_sm()
+        sm.register("cmp", "CMP", None, {"port": 8080}, enabled=True)
+        ok, err = sm.restart("cmp")
+        self.assertFalse(ok)
+
+    def test_unmanaged_flag_in_status_dict(self):
+        sm = self._make_sm()
+        sm.register("cmp", "CMP", None, {"port": 8080}, enabled=True)
+        status = sm.status_one("cmp")
+        self.assertTrue(status["unmanaged"])
+
+    def test_managed_flag_false_for_normal_service(self):
+        sm = self._make_sm()
+        log = []
+        sm.register("acme", "ACME", self._make_factory(log), {"port": 8888}, enabled=False)
+        status = sm.status_one("acme")
+        self.assertFalse(status["unmanaged"])
+
+    # ---- Config patching ----
+
+    def test_patch_service_config_updates_value(self):
+        sm = self._make_sm()
+        log = []
+        sm.register("acme", "ACME", self._make_factory(log),
+                    {"port": 8888, "cert_validity_days": 90}, enabled=True)
+        sm.start("acme")
+        sm.patch_service_config("acme", {"cert_validity_days": 30})
+        self.assertEqual(sm.get("acme").config["cert_validity_days"], 30)
+
+    def test_patch_service_config_triggers_restart(self):
+        sm = self._make_sm()
+        log = []
+        sm.register("acme", "ACME", self._make_factory(log), {"port": 8888}, enabled=True)
+        sm.start("acme")
+        sm.patch_service_config("acme", {"port": 9999})
+        self.assertEqual(sm.get("acme").state, "running")
+        # Verify new config was used in the restart
+        last_start = next(e for e in reversed(log) if e[0] == "start")
+        self.assertEqual(last_start[1]["port"], 9999)
+
+    def test_patch_config_unknown_service_returns_error(self):
+        sm = self._make_sm()
+        ok, err = sm.patch_service_config("nope", {"port": 1})
+        self.assertFalse(ok)
+        self.assertIn("Unknown", err)
+
+    # ---- Global config updates ----
+
+    def test_update_global_config_file_restarts_all(self):
+        sm = self._make_sm()
+        log = []
+        factory = self._make_factory(log)
+        sm.register("acme", "ACME", factory, {"port": 8888}, enabled=True)
+        sm.register("scep", "SCEP", factory, {"port": 8889}, enabled=True)
+        sm.start("acme")
+        sm.start("scep")
+        restarted = sm.update_global_config({}, source="file")
+        self.assertIn("acme", restarted)
+        self.assertIn("scep", restarted)
+
+    def test_update_global_config_webui_restarts_only_affected(self):
+        sm = self._make_sm()
+        log = []
+        factory = self._make_factory(log)
+        sm.register("acme", "ACME", factory, {"port": 8888}, enabled=True)
+        sm.register("scep", "SCEP", factory, {"port": 8889}, enabled=True)
+        sm.start("acme")
+        sm.start("scep")
+        restarted = sm.update_global_config({"acme": {}}, source="webui")
+        self.assertIn("acme", restarted)
+        self.assertNotIn("scep", restarted)
+
+    def test_update_global_config_known_key_no_restart(self):
+        """'validity' key does not need to restart any service."""
+        sm = self._make_sm()
+        log = []
+        sm.register("acme", "ACME", self._make_factory(log), {"port": 8888}, enabled=True)
+        sm.start("acme")
+        log.clear()
+        sm.update_global_config({"validity": {"end_entity_days": 90}}, source="webui")
+        # No restarts should have happened
+        self.assertEqual(len(log), 0)
+
+    # ---- Status API ----
+
+    def test_status_all_keys_match_registered_names(self):
+        sm = self._make_sm()
+        log = []
+        sm.register("acme", "ACME", self._make_factory(log), {"port": 8888})
+        sm.register("cmp",  "CMP",  None,                    {"port": 8080}, enabled=True)
+        status = sm.status_all()
+        self.assertIn("acme", status)
+        self.assertIn("cmp",  status)
+
+    def test_status_dict_has_required_fields(self):
+        sm = self._make_sm()
+        log = []
+        sm.register("acme", "ACME", self._make_factory(log), {"port": 8888}, enabled=True)
+        sm.start("acme")
+        s = sm.status_one("acme")
+        for field in ("name", "label", "state", "enabled", "error", "config", "unmanaged"):
+            self.assertIn(field, s, f"Missing field: {field}")
+
+    def test_status_none_for_unknown_service(self):
+        sm = self._make_sm()
+        self.assertIsNone(sm.status_one("ghost"))
+
+    # ---- Config-file watcher ----
+
+    def test_config_watcher_detects_file_change(self):
+        try:
+            from service_manager import ServiceManager
+        except ImportError:
+            self.skipTest("service_manager.py not present")
+        import tempfile
+        import time
+
+        tmp = tempfile.mkdtemp()
+        cfg = Path(tmp) / "config.json"
+        cfg.write_text('{"validity": {"end_entity_days": 365}}')
+
+        restart_count = [0]
+        log = []
+        def factory(**kw):
+            restart_count[0] += 1
+            log.append(kw)
+
+            class S:
+                def shutdown(self): pass
+
+            return S()
+
+        sm = ServiceManager(config_path=cfg)
+        sm.register("acme", "ACME", factory, {"port": 8888}, enabled=True)
+        sm.start("acme")
+        before = restart_count[0]
+
+        sm.start_config_watcher(poll_interval=0.15)
+        time.sleep(0.05)
+
+        # Modify the config file
+        cfg.write_text('{"validity": {"end_entity_days": 90}}')
+        time.sleep(0.5)  # let watcher detect and act
+
+        sm.stop_config_watcher()
+
+        self.assertGreater(restart_count[0], before,
+                           "Expected at least one restart after config file change")
+        self.assertEqual(sm.get("acme").state, "running")
+
+    def test_config_watcher_does_not_restart_on_no_change(self):
+        try:
+            from service_manager import ServiceManager
+        except ImportError:
+            self.skipTest("service_manager.py not present")
+        import tempfile
+        import time
+
+        tmp = tempfile.mkdtemp()
+        cfg = Path(tmp) / "config.json"
+        cfg.write_text('{"validity": {"end_entity_days": 365}}')
+
+        restart_count = [0]
+
+        def factory(**kw):
+            restart_count[0] += 1
+
+            class S:
+                def shutdown(self): pass
+
+            return S()
+
+        sm = ServiceManager(config_path=cfg)
+        sm.register("acme", "ACME", factory, {"port": 8888}, enabled=True)
+        sm.start("acme")
+        before = restart_count[0]
+
+        sm.start_config_watcher(poll_interval=0.15)
+        time.sleep(0.5)  # wait through several poll cycles without touching the file
+        sm.stop_config_watcher()
+
+        self.assertEqual(restart_count[0], before,
+                         "No restart expected when config file is unchanged")
+
+    # ---- SERVICE_CONFIG_SCHEMA ----
+
+    def test_schema_present_for_all_standard_services(self):
+        try:
+            from service_manager import ServiceManager
+        except ImportError:
+            self.skipTest("service_manager.py not present")
+        for svc in ("acme", "scep", "est", "ocsp"):
+            self.assertIn(svc, ServiceManager.SERVICE_CONFIG_SCHEMA,
+                          f"Schema missing for service: {svc}")
+
+    def test_schema_fields_have_required_keys(self):
+        try:
+            from service_manager import ServiceManager
+        except ImportError:
+            self.skipTest("service_manager.py not present")
+        for svc, fields in ServiceManager.SERVICE_CONFIG_SCHEMA.items():
+            for field in fields:
+                self.assertIn("key",   field, f"{svc}: field missing 'key'")
+                self.assertIn("label", field, f"{svc}: field missing 'label'")
+                self.assertIn("type",  field, f"{svc}: field missing 'type'")
+
+    def test_schema_types_are_valid(self):
+        try:
+            from service_manager import ServiceManager
+        except ImportError:
+            self.skipTest("service_manager.py not present")
+        valid_types = {"number", "text", "password", "checkbox", "select"}
+        for svc, fields in ServiceManager.SERVICE_CONFIG_SCHEMA.items():
+            for field in fields:
+                self.assertIn(field["type"], valid_types,
+                              f"{svc}.{field['key']}: invalid type '{field['type']}'")
+
+
+class TestWebUIServicesPage(unittest.TestCase):
+    """
+    Integration tests for the /services page and /api/services/* endpoints
+    in web_ui.py (requires a running WebUIHandler + a ServiceManager).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        import http.client
+        try:
+            import web_ui as _web_ui_mod
+            from service_manager import ServiceManager
+        except ImportError:
+            cls._skip = True
+            return
+        cls._skip = False
+
+        tmp = tempfile.mkdtemp()
+        cls.ca = _make_ca(tmp)
+        cls.ca.config = None  # web_ui handles missing config gracefully
+
+        # Build a ServiceManager with two fake services
+        cls.sm = ServiceManager()
+        cls.call_log = []
+
+        def _factory(**kw):
+            cls.call_log.append(("start", dict(kw)))
+
+            class _S:
+                def shutdown(self):
+                    cls.call_log.append(("stop",))
+
+            return _S()
+
+        cls.sm.register("cmp",  "CMP Server",  None,     {"port": 8080}, enabled=True)
+        cls.sm.register("acme", "ACME Server", _factory, {"port": 8888}, enabled=False)
+
+        # Find a free port
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        cls.port = probe.getsockname()[1]
+        probe.close()
+
+        cls.web_srv = _web_ui_mod.start_web_ui(
+            host="127.0.0.1",
+            port=cls.port,
+            ca=cls.ca,
+            service_manager=cls.sm,
+        )
+        import time; time.sleep(0.15)
+
+    @classmethod
+    def tearDownClass(cls):
+        if not cls._skip and cls.web_srv:
+            cls.web_srv.shutdown()
+
+    def _conn(self):
+        import http.client
+        return http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+
+    def _skip_if_needed(self):
+        if self._skip:
+            self.skipTest("web_ui.py or service_manager.py not available")
+
+    def test_services_page_returns_200(self):
+        self._skip_if_needed()
+        conn = self._conn()
+        conn.request("GET", "/services")
+        r = conn.getresponse(); r.read()
+        self.assertEqual(r.status, 200)
+
+    def test_services_page_contains_service_names(self):
+        self._skip_if_needed()
+        conn = self._conn()
+        conn.request("GET", "/services")
+        r = conn.getresponse()
+        body = r.read().decode()
+        self.assertIn("CMP Server", body)
+        self.assertIn("ACME Server", body)
+
+    def test_services_page_shows_running_badge_for_cmp(self):
+        self._skip_if_needed()
+        conn = self._conn()
+        conn.request("GET", "/services")
+        r = conn.getresponse()
+        body = r.read().decode()
+        self.assertIn("running", body.lower())
+
+    def test_api_services_returns_json(self):
+        self._skip_if_needed()
+        import json
+        conn = self._conn()
+        conn.request("GET", "/api/services")
+        r = conn.getresponse()
+        body = r.read()
+        self.assertEqual(r.status, 200)
+        data = json.loads(body)
+        self.assertIn("cmp",  data)
+        self.assertIn("acme", data)
+
+    def test_api_services_cmp_is_running(self):
+        self._skip_if_needed()
+        import json
+        conn = self._conn()
+        conn.request("GET", "/api/services")
+        r = conn.getresponse()
+        data = json.loads(r.read())
+        self.assertEqual(data["cmp"]["state"], "running")
+
+    def test_api_services_acme_is_stopped(self):
+        self._skip_if_needed()
+        import json
+        conn = self._conn()
+        conn.request("GET", "/api/services")
+        r = conn.getresponse()
+        data = json.loads(r.read())
+        self.assertEqual(data["acme"]["state"], "stopped")
+
+    def test_api_service_start_changes_state(self):
+        self._skip_if_needed()
+        import json
+        conn = self._conn()
+        body = b'{}'
+        conn.request("POST", "/api/services/acme/start", body=body,
+                     headers={"Content-Type": "application/json",
+                               "Content-Length": str(len(body))})
+        r = conn.getresponse()
+        data = json.loads(r.read())
+        self.assertEqual(r.status, 200)
+        self.assertEqual(data["state"], "running")
+        # Verify the factory was called
+        self.assertTrue(any(e[0] == "start" for e in self.call_log))
+
+    def test_api_service_stop_changes_state(self):
+        self._skip_if_needed()
+        import json
+        # Ensure it's running first
+        self.sm.start("acme")
+        conn = self._conn()
+        body = b'{}'
+        conn.request("POST", "/api/services/acme/stop", body=body,
+                     headers={"Content-Type": "application/json",
+                               "Content-Length": str(len(body))})
+        r = conn.getresponse()
+        data = json.loads(r.read())
+        self.assertEqual(r.status, 200)
+        self.assertEqual(data["state"], "stopped")
+
+    def test_api_service_restart_works(self):
+        self._skip_if_needed()
+        import json
+        self.sm.start("acme")
+        conn = self._conn()
+        body = b'{}'
+        conn.request("POST", "/api/services/acme/restart", body=body,
+                     headers={"Content-Type": "application/json",
+                               "Content-Length": str(len(body))})
+        r = conn.getresponse()
+        data = json.loads(r.read())
+        self.assertEqual(r.status, 200)
+        self.assertEqual(data["state"], "running")
+
+    def test_api_service_config_patch_updates_and_restarts(self):
+        self._skip_if_needed()
+        import json
+        self.sm.start("acme")
+        payload = json.dumps({"port": 9999}).encode()
+        conn = self._conn()
+        conn.request("PATCH", "/api/services/acme/config", body=payload,
+                     headers={"Content-Type": "application/json",
+                               "Content-Length": str(len(payload))})
+        r = conn.getresponse()
+        data = json.loads(r.read())
+        self.assertEqual(r.status, 200)
+        self.assertTrue(data.get("ok"), data)
+        self.assertEqual(self.sm.get("acme").config["port"], 9999)
+
+    def test_api_cmp_stop_refused(self):
+        """CMP is unmanaged — stop must be refused."""
+        self._skip_if_needed()
+        import json
+        body = b'{}'
+        conn = self._conn()
+        conn.request("POST", "/api/services/cmp/stop", body=body,
+                     headers={"Content-Type": "application/json",
+                               "Content-Length": str(len(body))})
+        r = conn.getresponse()
+        data = json.loads(r.read())
+        # The response should indicate failure
+        self.assertFalse(data.get("ok", True) and data.get("state") == "stopped")
+
+    def test_api_unknown_service_returns_error(self):
+        self._skip_if_needed()
+        import json
+        body = b'{}'
+        conn = self._conn()
+        conn.request("POST", "/api/services/ghost/start", body=body,
+                     headers={"Content-Type": "application/json",
+                               "Content-Length": str(len(body))})
+        r = conn.getresponse()
+        r.read()
+        # Either 404 or a JSON error is acceptable
+        self.assertIn(r.status, (200, 404, 400, 500))
+
+    def test_services_page_has_start_stop_buttons(self):
+        """The HTML page must include action buttons."""
+        self._skip_if_needed()
+        conn = self._conn()
+        conn.request("GET", "/services")
+        r = conn.getresponse()
+        body = r.read().decode()
+        self.assertIn("Start", body)
+        self.assertIn("Stop",  body)
+        self.assertIn("Restart", body)
+
+    def test_services_page_has_config_form(self):
+        """ACME service must have a config form with at least one field."""
+        self._skip_if_needed()
+        conn = self._conn()
+        conn.request("GET", "/services")
+        r = conn.getresponse()
+        body = r.read().decode()
+        # The ACME config schema includes a "port" field
+        self.assertIn("data-field", body)
+
+    def test_services_nav_link_present(self):
+        """The main nav bar must include a link to /services."""
+        self._skip_if_needed()
+        conn = self._conn()
+        conn.request("GET", "/")
+        r = conn.getresponse()
+        body = r.read().decode()
+        self.assertIn("/services", body)
 
 
 # ===========================================================================

@@ -9,7 +9,217 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.10.0] — 2026-02-27
+
 ### Added
+
+#### Service Management — Live Start / Stop / Restart from the Web UI
+
+A new `service_manager.py` module and matching Web UI page give operators
+full control over every PKI sub-service without restarting the whole process
+or touching the command line.
+
+##### `service_manager.py` — new module
+
+**`ServiceDef`** — per-service descriptor and lifecycle controller:
+
+- `start()` — calls the registered factory, stores the live server object,
+  transitions state to `running`
+- `stop()` — calls `server.shutdown()`, transitions state to `stopped`
+- `restart()` — `stop()` + `start()` in sequence
+- `patch_config(updates)` — deep-merges `updates` into the service's startup
+  kwargs dict and restarts the service
+- Thread-safe (internal `threading.Lock` on every state transition)
+- States: `stopped`, `starting`, `running`, `error`
+- `status_dict()` — returns a snapshot dict with `name`, `label`, `state`,
+  `enabled`, `error`, `config`, `unmanaged`
+
+**`ServiceManager`** — registry and bulk lifecycle controller:
+
+- `register(name, label, factory, config, enabled)` — add a service;
+  `factory=None` marks the service *unmanaged* (visible in the UI but cannot
+  be stopped/restarted — used for the CMP main server)
+- `start(name)` / `stop(name)` / `restart(name)` → `(ok: bool, error: str)`
+- `start_all_enabled()` — start every service whose `enabled` flag is `True`
+- `stop_all()` — stop every running managed service
+- `restart_all()` — restart every running or enabled managed service
+- `patch_service_config(name, updates)` → `(ok, error)` — updates config
+  **and restarts only that service** (no other service is affected)
+- `update_global_config(updates, source)`:
+  - `source="webui"` — restarts only the services whose config key appears in
+    `_KEY_TO_SERVICES` (e.g. `{"acme": ...}` restarts only the ACME service;
+    `{"validity": ...}` restarts nothing)
+  - `source="file"` — triggered by the config-file watcher; restarts **all**
+    managed services so the new config takes effect everywhere
+- `start_config_watcher(poll_interval=2.0)` — background daemon thread that
+  polls `ca/config.json` every `poll_interval` seconds; if the file mtime
+  changes since startup it triggers `update_global_config({}, source="file")`
+- `stop_config_watcher()` — signals the watcher thread to exit cleanly
+- `status_all()` / `status_one(name)` — snapshot status dicts (used by the
+  Web UI auto-refresh)
+- `SERVICE_CONFIG_SCHEMA` — per-service field metadata (key, label, type,
+  min/max/options) used to auto-generate configuration forms in the UI
+
+**Unmanaged CMP registration** — the CMP main server socket is registered with
+`factory=None` so it appears in the UI as `Running` but the Stop/Restart
+buttons are correctly disabled.
+
+##### `web_ui.py` — new Services page and REST API
+
+**New page: `/services`**
+
+- One card per service showing: animated status pulse dot (green / grey / red /
+  amber per state), state badge, Start / Stop / Restart buttons
+- Start/Stop/Restart buttons are disabled when the action is not applicable
+  (e.g. Stop is disabled when already stopped)
+- Per-service collapsible **⚙ Configuration** section with type-aware form
+  inputs (number, text, password, checkbox, select) auto-generated from
+  `ServiceManager.SERVICE_CONFIG_SCHEMA`
+- **Save & Restart** button — sends `PATCH /api/services/<n>/config`;
+  restarts only the affected service
+- Status auto-refreshes every 5 seconds via JavaScript polling
+  `GET /api/services`
+- Page is gracefully degraded when no `ServiceManager` is attached (shows an
+  informational message rather than an error)
+
+**New REST endpoints (Web UI server):**
+
+| Method | Path | Description |
+|---|---|---|
+| `GET`   | `/api/services` | Status dict for all registered services |
+| `POST`  | `/api/services/<n>/start` | Start a service |
+| `POST`  | `/api/services/<n>/stop` | Stop a service |
+| `POST`  | `/api/services/<n>/restart` | Restart a service |
+| `PATCH` | `/api/services/<n>/config` | Update service config and restart it |
+
+All service control actions are recorded in the audit log
+(`service_start`, `service_stop`, `service_restart`, `service_config_patch`).
+
+**Navigation bar** — "Services" tab added between "Sub-CA" and "Metrics".
+
+##### `pki_server.py` — ServiceManager integration
+
+- `ServiceManager` is instantiated in `main()` before any sub-service is started
+- Each optional service (ACME, SCEP, EST, OCSP) is registered with its exact
+  CLI-derived startup kwargs
+- The CMP main server is registered as unmanaged (`factory=None`, `enabled=True`)
+- Every service that has a registered `ServiceDef` is started **through** the
+  `ServiceManager` (`sm.start("acme")` etc.) so state is tracked from the very
+  first boot, not just after a UI-initiated restart
+- `start_config_watcher()` is called after all services are up
+- `service_manager=_sm` is passed to `start_web_ui()`; if `service_manager.py`
+  is not present in the directory, startup continues normally with a
+  `WARNING` log and all service management features gracefully absent
+
+#### Test Suite — 41 new tests (282 total, 35 test classes)
+
+`TestServiceManager` (26 tests):
+- `test_start_changes_state_to_running` — state transitions from stopped to running
+- `test_stop_changes_state_to_stopped` — stop transitions to stopped
+- `test_restart_returns_service_to_running` — restart ends in running state
+- `test_restart_calls_stop_then_start` — ordering: stop precedes start
+- `test_start_all_enabled_starts_only_enabled` — disabled services not started
+- `test_stop_all_stops_running_services` — all running services stopped
+- `test_unknown_service_returns_error` — meaningful error for unknown name
+- `test_unmanaged_service_state_running_on_register` — CMP-like state on register
+- `test_unmanaged_service_stop_refused` — stop returns `ok=False` + message
+- `test_unmanaged_service_restart_refused` — restart returns `ok=False`
+- `test_unmanaged_flag_in_status_dict` — `unmanaged=True` in status
+- `test_managed_flag_false_for_normal_service` — `unmanaged=False` for managed
+- `test_patch_service_config_updates_value` — config dict patched in-place
+- `test_patch_service_config_triggers_restart` — new config used in restart factory call
+- `test_patch_config_unknown_service_returns_error` — error on unknown name
+- `test_update_global_config_file_restarts_all` — `source="file"` restarts all
+- `test_update_global_config_webui_restarts_only_affected` — selective restart
+- `test_update_global_config_known_key_no_restart` — `validity` key → 0 restarts
+- `test_status_all_keys_match_registered_names` — all names in status dict
+- `test_status_dict_has_required_fields` — all required fields present
+- `test_status_none_for_unknown_service` — `None` for unknown name
+- `test_config_watcher_detects_file_change` — mtime change triggers restart
+- `test_config_watcher_does_not_restart_on_no_change` — no spurious restarts
+- `test_schema_present_for_all_standard_services` — schema covers acme/scep/est/ocsp
+- `test_schema_fields_have_required_keys` — every field has key/label/type
+- `test_schema_types_are_valid` — type is one of the allowed set
+
+`TestWebUIServicesPage` (15 tests — live HTTP over a real `WebUIHandler`):
+- `test_services_page_returns_200` — GET /services HTTP 200
+- `test_services_page_contains_service_names` — page body contains service labels
+- `test_services_page_shows_running_badge_for_cmp` — running state rendered
+- `test_api_services_returns_json` — GET /api/services returns valid JSON
+- `test_api_services_cmp_is_running` — CMP state = running
+- `test_api_services_acme_is_stopped` — ACME state = stopped initially
+- `test_api_service_start_changes_state` — POST start → state running
+- `test_api_service_stop_changes_state` — POST stop → state stopped
+- `test_api_service_restart_works` — POST restart → state running
+- `test_api_service_config_patch_updates_and_restarts` — PATCH config applied + restart
+- `test_api_cmp_stop_refused` — unmanaged CMP stop rejected
+- `test_api_unknown_service_returns_error` — unknown service handled gracefully
+- `test_services_page_has_start_stop_buttons` — HTML contains button labels
+- `test_services_page_has_config_form` — config form rendered for ACME
+- `test_services_nav_link_present` — nav bar includes /services link
+
+### Changed
+
+- `start_web_ui()` signature extended: new optional `service_manager` parameter
+  (default `None` — backward-compatible; existing callers unaffected)
+- Navigation bar in `web_ui.py` gains a "Services" entry between "Sub-CA" and
+  "Metrics"; all pages updated accordingly
+- `pki_server.py` service startup block refactored: when `ServiceManager` is
+  available, each service is started through it; when not available, the
+  original direct-call path is used unchanged
+- `test_pki_server.py`: `import socket` added to the standard import block
+  (was already used in `TestHTTPAPI` via `http.client`; now also needed by
+  `TestWebUIServicesPage.setUpClass`)
+
+### Fixed
+
+- No bug fixes in this release; all changes are additive
+
+---
+
+## Releasing v0.10.0
+
+```bash
+git add service_manager.py web_ui.py pki_server.py test_pki_server.py CHANGELOG.md README.md
+git commit -m "v0.10.0: Service management — start/stop/restart from Web UI
+
+New module: service_manager.py
+- ServiceDef: per-service lifecycle controller (start/stop/restart/patch_config)
+- ServiceManager: registry with bulk ops and selective config-driven restarts
+- Config-file watcher: detects ca/config.json mtime changes, restarts all services
+- SERVICE_CONFIG_SCHEMA: field metadata for UI form generation
+
+web_ui.py:
+- New /services page: per-service cards with action buttons + config forms
+- Status auto-refresh every 5s via GET /api/services
+- New REST API: GET /api/services, POST /api/services/<n>/start|stop|restart,
+  PATCH /api/services/<n>/config
+- All service actions recorded in the audit log
+- 'Services' nav tab added
+
+pki_server.py:
+- ServiceManager instantiated in main() before service startup
+- Each service started through SM so state is tracked from first boot
+- Config-file watcher started after all services are up
+- Graceful fallback when service_manager.py is absent
+
+Tests: 41 new tests (282 total, 35 test classes)
+- TestServiceManager: 26 unit tests covering all lifecycle paths
+- TestWebUIServicesPage: 15 live-HTTP integration tests"
+
+git tag -a v0.10.0 -m "v0.10.0: Service management from Web UI"
+git push && git push origin v0.10.0
+
+gh release create v0.10.0 \
+  --title "v0.10.0 — Service Management from Web UI" \
+  --notes-file CHANGELOG.md
+```
+
+---
+
+
 
 #### Admin API Authentication
 

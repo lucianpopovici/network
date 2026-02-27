@@ -31,10 +31,13 @@ import re
 import threading
 import urllib.parse
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import Encoding
+
+if TYPE_CHECKING:
+    from service_manager import ServiceManager
 
 logger = logging.getLogger("web-ui")
 
@@ -87,7 +90,25 @@ _CSS = """
   .search-bar input { max-width: 320px; }
   code { background: #f3f4f6; padding: 2px 6px; border-radius: 3px; font-size: .85rem; font-family: monospace; }
   pre { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 6px; font-size: .83rem; overflow-x: auto; }
-  @media(max-width:700px){ .stats-grid{grid-template-columns:1fr 1fr;} .grid-2{grid-template-columns:1fr;} }
+  .badge-running { background: #d1fae5; color: #065f46; border-radius: 4px; padding: 2px 8px; font-size: .78rem; }
+  .badge-stopped { background: #e5e7eb; color: #374151; border-radius: 4px; padding: 2px 8px; font-size: .78rem; }
+  .badge-error   { background: #fee2e2; color: #991b1b; border-radius: 4px; padding: 2px 8px; font-size: .78rem; }
+  .badge-starting{ background: #fef3c7; color: #92400e; border-radius: 4px; padding: 2px 8px; font-size: .78rem; }
+  .svc-card { border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 16px; overflow: hidden; }
+  .svc-head { background: #f8f9fb; padding: 14px 20px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #e5e7eb; }
+  .svc-head h3 { font-size: .98rem; font-weight: 600; flex: 1; }
+  .svc-body { padding: 18px 20px; }
+  .svc-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .cfg-section { margin-top: 14px; border-top: 1px solid #eee; padding-top: 14px; }
+  .cfg-section summary { font-size: .87rem; font-weight: 600; cursor: pointer; color: #374151; margin-bottom: 10px; }
+  .cfg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+  .error-box { background: #fee2e2; border: 1px solid #fca5a5; border-radius: 5px; padding: 8px 12px; font-size: .83rem; color: #991b1b; margin-top: 8px; }
+  .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .pulse-green  { background: #10b981; box-shadow: 0 0 0 2px #d1fae5; animation: pulse 2s infinite; }
+  .pulse-red    { background: #ef4444; }
+  .pulse-gray   { background: #9ca3af; }
+  .pulse-yellow { background: #f59e0b; animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{box-shadow:0 0 0 2px #d1fae5;} 50%{box-shadow:0 0 0 5px #d1fae580;} }
 </style>
 """
 
@@ -122,21 +143,107 @@ function issueSubCA() {
       document.getElementById('subca-result').textContent = JSON.stringify(d, null, 2);
     });
 }
+
+/* ── Service management ─────────────────────────────────── */
+
+function svcAction(name, action) {
+  const btn = document.querySelector(`[data-svc="${name}"][data-action="${action}"]`);
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  fetch('/api/services/' + name + '/' + action, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({})
+  })
+  .then(r => r.json())
+  .then(d => {
+    if (btn) { btn.disabled = false; btn.textContent = action.charAt(0).toUpperCase()+action.slice(1); }
+    refreshSvcStatus(name, d);
+  })
+  .catch(e => {
+    if (btn) { btn.disabled = false; btn.textContent = action.charAt(0).toUpperCase()+action.slice(1); }
+    console.error('Service action failed', e);
+  });
+}
+
+function saveSvcConfig(name) {
+  const form = document.getElementById('svc-form-' + name);
+  if (!form) return;
+  const data = {};
+  form.querySelectorAll('[data-field]').forEach(el => {
+    const k = el.dataset.field;
+    if (el.type === 'checkbox')      data[k] = el.checked;
+    else if (el.type === 'number')   data[k] = el.value === '' ? null : Number(el.value);
+    else                             data[k] = el.value;
+  });
+  const btn = form.querySelector('.btn-save-cfg');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+  fetch('/api/services/' + name + '/config', {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(data)
+  })
+  .then(r => r.json())
+  .then(d => {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save & Restart'; }
+    refreshSvcStatus(name, d);
+    const res = document.getElementById('svc-result-' + name);
+    if (res) { res.style.display='block'; res.textContent = d.ok ? '✓ Applied and restarted' : ('Error: '+(d.error||'unknown')); }
+  })
+  .catch(e => {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save & Restart'; }
+  });
+}
+
+function refreshSvcStatus(name, d) {
+  const stateEl = document.getElementById('svc-state-' + name);
+  const errorEl = document.getElementById('svc-error-' + name);
+  const pulseEl = document.getElementById('svc-pulse-' + name);
+  if (stateEl && d.state) {
+    stateEl.className = 'badge-' + d.state;
+    stateEl.textContent = d.state.charAt(0).toUpperCase() + d.state.slice(1);
+  }
+  if (pulseEl && d.state) {
+    const map = {running:'pulse pulse-green', stopped:'pulse pulse-gray', error:'pulse pulse-red', starting:'pulse pulse-yellow'};
+    pulseEl.className = map[d.state] || 'pulse pulse-gray';
+  }
+  if (errorEl) {
+    errorEl.style.display = d.error ? 'block' : 'none';
+    errorEl.textContent = d.error || '';
+  }
+}
+
+/* Auto-refresh service status every 5 seconds */
+function autoRefreshServices() {
+  if (!document.getElementById('services-page')) return;
+  fetch('/api/services')
+    .then(r => r.json())
+    .then(services => {
+      Object.entries(services).forEach(([name, d]) => refreshSvcStatus(name, d));
+    })
+    .catch(() => {});
+  setTimeout(autoRefreshServices, 5000);
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', autoRefreshServices);
+} else {
+  autoRefreshServices();
+}
 </script>
 """
 
 
 def _page(title: str, body: str, active: str = "") -> str:
     nav_links = [
-        ("Dashboard", "/", "dashboard"),
-        ("Certificates", "/certs", "certs"),
-        ("Expiring", "/expiring", "expiring"),
-        ("Revocation", "/revocation", "revocation"),
-        ("Sub-CA", "/sub-ca", "sub-ca"),
-        ("Metrics", "/metrics-ui", "metrics-ui"),
-        ("Config", "/config-ui", "config-ui"),
-        ("Audit Log", "/audit", "audit"),
-        ("API Docs", "/api-docs", "api-docs"),
+        ("Dashboard",    "/",           "dashboard"),
+        ("Certificates", "/certs",      "certs"),
+        ("Expiring",     "/expiring",   "expiring"),
+        ("Revocation",   "/revocation", "revocation"),
+        ("Sub-CA",       "/sub-ca",     "sub-ca"),
+        ("Services",     "/services",   "services"),
+        ("Metrics",      "/metrics-ui", "metrics-ui"),
+        ("Config",       "/config-ui",  "config-ui"),
+        ("Audit Log",    "/audit",      "audit"),
+        ("API Docs",     "/api-docs",   "api-docs"),
     ]
     nav = "".join(
         f'<a href="{href}" class="{"active" if tag==active else ""}">{label}</a>'
@@ -174,6 +281,7 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     rate_limiter: "RateLimiter" = None
     admin_api_key: Optional[str] = None   # If set, required for mutating endpoints
     admin_allowed_cns: Optional[list] = None  # mTLS CN allowlist
+    service_manager: Optional["ServiceManager"] = None  # Service lifecycle manager
     cmp_base_url: str = "http://localhost:8080"
     acme_base_url: str = ""
     scep_base_url: str = ""
@@ -267,6 +375,8 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._subca_page()
             elif path == "/config-ui":
                 self._config_page()
+            elif path == "/services":
+                self._services_page()
             elif path == "/audit":
                 self._audit_page()
             elif path == "/api-docs":
@@ -283,6 +393,16 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_audit()
             elif path == "/api/metrics":
                 self._api_metrics()
+            elif path == "/api/services":
+                self._api_services_status()
+            elif path.startswith("/api/services/") and len(path.split("/")) == 4:
+                # /api/services/<name>/status
+                parts = path.split("/")
+                svc_name, sub = parts[3], parts[4] if len(parts) > 4 else "status"
+                if sub == "status" or path.endswith("/" + svc_name):
+                    self._api_service_status(svc_name)
+                else:
+                    self._send_html(404, "<h2>404 Not found</h2>")
             else:
                 self._send_html(404, "<h2>404 Not found</h2>")
         except Exception as e:
@@ -332,6 +452,21 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
                 self._api_patch_config(data)
             elif path == "/api/issue-sub-ca":
                 self._api_issue_sub_ca(data)
+            elif path.startswith("/api/services/"):
+                # /api/services/<name>/<action>   POST  → start/stop/restart
+                # /api/services/<name>/config      PATCH → update config
+                parts = path.split("/")
+                if len(parts) >= 5:
+                    svc_name = parts[3]
+                    action   = parts[4]
+                    if action in ("start", "stop", "restart"):
+                        self._api_service_action(svc_name, action)
+                    elif action == "config":
+                        self._api_service_patch_config(svc_name, data)
+                    else:
+                        self._send_json({"error": f"unknown action: {action}"}, 400)
+                else:
+                    self._send_json({"error": "not found"}, 404)
             else:
                 self._send_json({"error": "not found"}, 404)
         except Exception as e:
@@ -743,6 +878,215 @@ function renewCert(serial) {
         self.end_headers()
         self.wfile.write(data)
 
+    def _services_page(self):
+        """Render the Services management page."""
+        sm = self.service_manager
+        if sm is None:
+            body = """
+<div class="card">
+  <div class="card-head"><h2>Services</h2></div>
+  <div class="card-body">
+    <p style="color:#6b7280">Service management is not available.
+    Start the server with a <code>ServiceManager</code> attached to enable this feature.</p>
+  </div>
+</div>"""
+            self._send_html(200, _page("Services", body, "services"))
+            return
+
+        from service_manager import ServiceManager as SM
+
+        def _pulse(state):
+            m = {"running": "pulse pulse-green", "stopped": "pulse pulse-gray",
+                 "error": "pulse pulse-red", "starting": "pulse pulse-yellow"}
+            return f'<span class="{m.get(state, "pulse pulse-gray")}" id="svc-pulse-{{}}" style="vertical-align:middle"></span>'
+
+        def _badge(state):
+            return f'<span class="badge-{state}" id="svc-state-{{}}">{state.capitalize()}</span>'
+
+        cards = ""
+        for name, info in sm.status_all().items():
+            state   = info["state"]
+            label   = info["label"]
+            error   = info["error"] or ""
+            cfg     = info["config"]
+            schema  = SM.SERVICE_CONFIG_SCHEMA.get(name, [])
+
+            # Action buttons
+            start_disabled   = 'disabled' if state == 'running'  else ''
+            stop_disabled    = 'disabled' if state == 'stopped'   else ''
+            restart_disabled = 'disabled' if state == 'stopped'   else ''
+
+            actions = f"""
+<div class="svc-actions">
+  <button class="btn btn-primary" {start_disabled}
+    data-svc="{name}" data-action="start"
+    onclick="svcAction('{name}','start')">Start</button>
+  <button class="btn btn-danger" {stop_disabled}
+    data-svc="{name}" data-action="stop"
+    onclick="svcAction('{name}','stop')">Stop</button>
+  <button class="btn btn-secondary" {restart_disabled}
+    data-svc="{name}" data-action="restart"
+    onclick="svcAction('{name}','restart')">Restart</button>
+</div>"""
+
+            error_html = ""
+            if error:
+                error_html = f'<div class="error-box" id="svc-error-{name}">{html.escape(error)}</div>'
+            else:
+                error_html = f'<div class="error-box" id="svc-error-{name}" style="display:none"></div>'
+
+            # Config form
+            form_rows = ""
+            for field in schema:
+                fkey  = field["key"]
+                flabel = field["label"]
+                ftype  = field["type"]
+                val    = cfg.get(fkey, "")
+
+                if ftype == "checkbox":
+                    checked = "checked" if val else ""
+                    form_rows += f"""
+<div class="form-row">
+  <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+    <input type="checkbox" data-field="{fkey}" {checked}
+           style="width:auto;border-radius:3px;cursor:pointer"> {html.escape(flabel)}
+  </label>
+</div>"""
+                elif ftype == "select":
+                    opts = "".join(
+                        f'<option value="{o}" {"selected" if o==str(val) else ""}>{o}</option>'
+                        for o in field.get("options", [])
+                    )
+                    form_rows += f"""
+<div class="form-row">
+  <label>{html.escape(flabel)}</label>
+  <select data-field="{fkey}">{opts}</select>
+</div>"""
+                elif ftype == "password":
+                    form_rows += f"""
+<div class="form-row">
+  <label>{html.escape(flabel)}</label>
+  <input type="password" data-field="{fkey}" value="{html.escape(str(val))}">
+</div>"""
+                else:
+                    min_attr = f'min="{field["min"]}"' if "min" in field else ""
+                    max_attr = f'max="{field["max"]}"' if "max" in field else ""
+                    inp_type = "number" if ftype == "number" else "text"
+                    form_rows += f"""
+<div class="form-row">
+  <label>{html.escape(flabel)}</label>
+  <input type="{inp_type}" data-field="{fkey}" value="{html.escape(str(val))}"
+         {min_attr} {max_attr}>
+</div>"""
+
+            cfg_section = ""
+            if schema:
+                cfg_section = f"""
+<details class="cfg-section" {'open' if state=='running' else ''}>
+  <summary>⚙ Configuration</summary>
+  <div class="cfg-grid" id="svc-form-{name}">
+    {form_rows}
+  </div>
+  <div style="margin-top:12px;display:flex;align-items:center;gap:10px">
+    <button class="btn btn-primary btn-save-cfg"
+            onclick="saveSvcConfig('{name}')">Save &amp; Restart</button>
+    <span id="svc-result-{name}" style="font-size:.83rem;color:#065f46;display:none"></span>
+  </div>
+</details>"""
+
+            pulse_cls = {"running": "pulse pulse-green", "stopped": "pulse pulse-gray",
+                         "error": "pulse pulse-red", "starting": "pulse pulse-yellow"}.get(state, "pulse pulse-gray")
+            badge_cls = f"badge-{state}"
+
+            cards += f"""
+<div class="svc-card">
+  <div class="svc-head">
+    <span class="{pulse_cls}" id="svc-pulse-{name}"></span>
+    <h3>{html.escape(label)}</h3>
+    <span class="{badge_cls}" id="svc-state-{name}">{state.capitalize()}</span>
+  </div>
+  <div class="svc-body">
+    {actions}
+    {error_html}
+    {cfg_section}
+  </div>
+</div>"""
+
+        body = f"""
+<div id="services-page">
+  <div class="card">
+    <div class="card-head">
+      <h2>Service Management</h2>
+      <span style="font-size:.82rem;color:#6b7280">Status auto-refreshes every 5 seconds</span>
+    </div>
+    <div class="card-body">
+      <p style="font-size:.86rem;color:#6b7280;margin-bottom:18px">
+        Start, stop, or restart individual PKI services without affecting others.
+        Saving a service's configuration automatically restarts only that service.
+        Changes to <code>config.json</code> on disk restart all services.
+      </p>
+      {cards}
+    </div>
+  </div>
+</div>"""
+        self._send_html(200, _page("Services", body, "services"))
+
+    def _api_services_status(self):
+        """GET /api/services — return status dict for all services."""
+        sm = self.service_manager
+        if sm is None:
+            self._send_json({"error": "service manager not available"}, 503)
+            return
+        self._send_json(sm.status_all())
+
+    def _api_service_status(self, name: str):
+        """GET /api/services/<n> — return status dict for one service."""
+        sm = self.service_manager
+        if sm is None:
+            self._send_json({"error": "service manager not available"}, 503)
+            return
+        info = sm.status_one(name)
+        if info is None:
+            self._send_json({"error": f"unknown service: {name}"}, 404)
+            return
+        self._send_json(info)
+
+    def _api_service_action(self, name: str, action: str):
+        """POST /api/services/<n>/<start|stop|restart>"""
+        sm = self.service_manager
+        if sm is None:
+            self._send_json({"error": "service manager not available"}, 503)
+            return
+        method = getattr(sm, action, None)
+        if method is None:
+            self._send_json({"error": f"unknown action: {action}"}, 400)
+            return
+        ok, err = method(name)
+        info = sm.status_one(name) or {}
+        if self.audit_log:
+            self.audit_log.record(
+                f"service_{action}",
+                f"service={name} ok={ok}",
+                self.client_address[0],
+            )
+        self._send_json({**info, "ok": ok, "error": err or None})
+
+    def _api_service_patch_config(self, name: str, data: dict):
+        """PATCH /api/services/<n>/config — update per-service config and restart."""
+        sm = self.service_manager
+        if sm is None:
+            self._send_json({"error": "service manager not available"}, 503)
+            return
+        ok, err = sm.patch_service_config(name, data)
+        info = sm.status_one(name) or {}
+        if self.audit_log:
+            self.audit_log.record(
+                "service_config_patch",
+                f"service={name} keys={list(data.keys())}",
+                self.client_address[0],
+            )
+        self._send_json({**info, "ok": ok, "error": err or None})
+
     def _api_certs(self):
         self._send_json({"certificates": self.ca.list_certificates()})
 
@@ -842,6 +1186,7 @@ def start_web_ui(
     ocsp_base_url: str = "",
     admin_api_key: Optional[str] = None,
     admin_allowed_cns: Optional[list] = None,
+    service_manager: Optional["ServiceManager"] = None,
 ) -> http.server.HTTPServer:
     """Start the web UI in a background daemon thread."""
 
@@ -858,6 +1203,7 @@ def start_web_ui(
     BoundWebUIHandler.ocsp_base_url = ocsp_base_url
     BoundWebUIHandler.admin_api_key = admin_api_key
     BoundWebUIHandler.admin_allowed_cns = admin_allowed_cns
+    BoundWebUIHandler.service_manager = service_manager
 
     import http.server as _hs
 
