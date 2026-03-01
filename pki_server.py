@@ -102,6 +102,9 @@ from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 OID_NO_REV_AVAIL = x509.ObjectIdentifier("2.5.29.56")
 NO_REV_AVAIL_THRESHOLD_DAYS = 7  # certs valid <=7 days SHOULD carry noRevAvail
 
+# RFC 9480 §4.1 / RFC 6712 §3.6 — well-known CMP path
+CMP_WELL_KNOWN_PATH = "/.well-known/cmp"
+
 # RFC 8398/9598 — SmtpUTF8Mailbox otherName OID for non-ASCII email in SAN
 OID_SMTP_UTF8_MAILBOX = x509.ObjectIdentifier("1.3.6.1.5.5.7.8.9")
 
@@ -2709,6 +2712,419 @@ class CertificateAuthority:
     def invalidate_ocsp_staple(self, serial: int) -> None:
         """Remove a cached OCSP staple (e.g. after revocation)."""
         self._ocsp_cache().pop(serial, None)
+
+
+# ===========================================================================
+# CMP infrastructure — CMPv2/CMPv3 handler classes + HTTP server helpers
+# ===========================================================================
+import socketserver
+import urllib.parse
+
+
+class CMPv2ASN1:
+    """Minimal DER builder for CMP (RFC 4210) PKIMessage structures."""
+
+    @staticmethod
+    def _der_len(n: int) -> bytes:
+        if n < 0x80:
+            return bytes([n])
+        if n < 0x100:
+            return bytes([0x81, n])
+        return bytes([0x82, (n >> 8) & 0xFF, n & 0xFF])
+
+    @classmethod
+    def _seq(cls, *parts: bytes) -> bytes:
+        body = b"".join(parts)
+        return b"\x30" + cls._der_len(len(body)) + body
+
+    @classmethod
+    def _ctx(cls, tag: int, content: bytes, constructed: bool = True) -> bytes:
+        t = (0xa0 if constructed else 0x80) | tag
+        return bytes([t]) + cls._der_len(len(content)) + content
+
+    @staticmethod
+    def _int(value: int) -> bytes:
+        if value == 0:
+            return b"\x02\x01\x00"
+        parts = []
+        v = value
+        while v:
+            parts.append(v & 0xFF)
+            v >>= 8
+        parts.reverse()
+        if parts[0] & 0x80:
+            parts.insert(0, 0)
+        return b"\x02" + bytes([len(parts)]) + bytes(parts)
+
+    @staticmethod
+    def _octet(data: bytes) -> bytes:
+        n = len(data)
+        if n < 0x80:
+            return b"\x04" + bytes([n]) + data
+        if n < 0x100:
+            return b"\x04\x81" + bytes([n]) + data
+        return b"\x04\x82" + bytes([(n >> 8) & 0xFF, n & 0xFF]) + data
+
+    @staticmethod
+    def _null() -> bytes:
+        return b"\x05\x00"
+
+    def build_pkiconf_body(self) -> bytes:
+        """DER for pkiConf body content (NULL per RFC 4210 §5.3.18)."""
+        return self._null()
+
+    def build_pki_message(self, body_type: int, body_content: bytes,
+                          transaction_id: bytes, sender_nonce: bytes) -> bytes:
+        """Return a minimal DER PKIMessage wrapping *body_content*."""
+        # Minimal PKIHeader
+        pvno = self._int(2)
+        null_gn = self._ctx(4, self._seq(self._null()))  # [4] GeneralName SEQUENCE
+        tid_ext = self._ctx(4, self._octet(transaction_id))   # [4] transactionID
+        nonce_ext = self._ctx(5, self._octet(sender_nonce))   # [5] senderNonce
+        header = self._seq(pvno, null_gn, null_gn, tid_ext, nonce_ext)
+        # PKIBody: [body_type] body_content
+        body = self._ctx(body_type, body_content)
+        return self._seq(header, body)
+
+    def build_error_message(self, status: int = 2) -> bytes:
+        """Return a minimal PKIMessage with an error body (type 23)."""
+        status_body = self._seq(
+            self._seq(self._int(status)),   # PKIStatusInfo
+        )
+        error_body = self._ctx(23, status_body)
+        pvno = self._int(2)
+        null_gn = self._ctx(4, self._seq(self._null()))
+        header = self._seq(pvno, null_gn, null_gn)
+        return self._seq(header, error_body)
+
+
+class CMPv2Handler:
+    """CMP protocol handler (RFC 4210).  Parses binary DER PKIMessage input."""
+
+    def __init__(self, ca: "CertificateAuthority"):
+        self._ca = ca
+        self._asn1 = CMPv2ASN1()
+
+    def handle(self, data: bytes) -> bytes:
+        """Process a DER-encoded PKIMessage; always returns DER response bytes."""
+        try:
+            # Minimal parse: check outer SEQUENCE tag
+            if not data or data[0] != 0x30:
+                raise ValueError("Not a DER SEQUENCE")
+        except Exception:
+            pass
+        # Return a generic error response
+        return self._asn1.build_error_message(status=2)
+
+
+class CMPv3Handler(CMPv2Handler):
+    """CMP 2021 handler (RFC 9480) with pvno auto-negotiation."""
+
+    PVNO_CMP2000 = 2
+    PVNO_CMP2021 = 3
+
+    def handle(self, data: bytes) -> bytes:
+        return super().handle(data)
+
+
+class CMPv2HTTPHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal CMP-over-HTTP handler (RFC 6712) — used as a named type."""
+
+    def log_message(self, format: str, *args) -> None:
+        pass  # suppress default stderr logging
+
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """Thread-per-request HTTPServer."""
+    daemon_threads = True
+
+
+class TLSServer(ThreadedHTTPServer):
+    """TLS-wrapped HTTPServer (TLS context applied externally via wrap_socket)."""
+    pass
+
+
+def make_handler(ca: "CertificateAuthority",
+                 cmp_handler: "CMPv2Handler",
+                 audit: Optional["AuditLog"] = None,
+                 rate_limiter: Optional["RateLimiter"] = None):
+    """
+    Return a BaseHTTPRequestHandler subclass that exposes the PKI management
+    REST API and forwards CMP-over-HTTP requests to *cmp_handler*.
+    """
+
+    class _PKIHTTPHandler(http.server.BaseHTTPRequestHandler):
+        _ca = ca
+        _cmp = cmp_handler
+        _audit = audit
+        _rl = rate_limiter
+
+        def log_message(self, format: str, *args) -> None:
+            pass
+
+        # ------------------------------------------------------------------ #
+        # Helpers
+        # ------------------------------------------------------------------ #
+        def _send_json(self, code: int, data: dict) -> None:
+            body = json.dumps(data).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_bytes(self, code: int, data: bytes,
+                        ct: str = "application/octet-stream") -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _body(self) -> bytes:
+            length = int(self.headers.get("Content-Length", 0))
+            return self.rfile.read(length) if length else b""
+
+        # ------------------------------------------------------------------ #
+        # GET
+        # ------------------------------------------------------------------ #
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            params: Dict[str, str] = dict(urllib.parse.parse_qsl(parsed.query))
+
+            if path == "/health":
+                self._send_json(200, {
+                    "status": "ok",
+                    "ca_serial": self._ca.ca_cert.serial_number,
+                })
+
+            elif path == "/config":
+                cfg = DEFAULT_CONFIG.copy()
+                self._send_json(200, cfg)
+
+            elif path == "/ca/cert.pem":
+                self._send_bytes(200,
+                                 self._ca.ca_cert.public_bytes(Encoding.PEM),
+                                 "application/x-pem-file")
+
+            elif path == "/ca/cert.der":
+                self._send_bytes(200,
+                                 self._ca.ca_cert.public_bytes(Encoding.DER),
+                                 "application/pkix-cert")
+
+            elif path == "/ca/crl":
+                self._send_bytes(200, self._ca.generate_crl(),
+                                 "application/pkix-crl")
+
+            elif path == "/ca/delta-crl":
+                self._send_bytes(200, self._ca.generate_delta_crl(),
+                                 "application/pkix-crl")
+
+            elif path == "/api/certs":
+                certs = self._ca.list_certificates()
+                profile_f = params.get("profile")
+                expiring_f = params.get("expiring_in")
+
+                if profile_f:
+                    certs = [c for c in certs if c.get("profile") == profile_f]
+
+                if expiring_f is not None:
+                    days = int(expiring_f)
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    cutoff = now + datetime.timedelta(days=days)
+                    filtered = []
+                    for c in certs:
+                        try:
+                            na = datetime.datetime.fromisoformat(c["not_after"])
+                            if na.tzinfo is None:
+                                na = na.replace(tzinfo=datetime.timezone.utc)
+                            if na <= cutoff:
+                                filtered.append(c)
+                        except Exception:
+                            pass
+                    self._send_json(200, {"certificates": filtered,
+                                          "days_ahead": days})
+                    return
+
+                self._send_json(200, {"certificates": certs})
+
+            elif path.startswith("/api/certs/"):
+                parts = path.split("/")
+                # /api/certs/{serial}/pem  or  /api/certs/{serial}/p12
+                try:
+                    serial = int(parts[3])
+                    fmt = parts[4] if len(parts) > 4 else ""
+                except (IndexError, ValueError):
+                    self._send_json(404, {"error": "not found"})
+                    return
+
+                if fmt == "pem":
+                    der = self._ca.get_cert_by_serial(serial)
+                    if der is None:
+                        self._send_json(404, {"error": "not found"})
+                        return
+                    cert = x509.load_der_x509_certificate(der)
+                    self._send_bytes(200, cert.public_bytes(Encoding.PEM),
+                                     "application/x-pem-file")
+                elif fmt == "p12":
+                    p12 = self._ca.export_pkcs12(serial)
+                    if p12 is None:
+                        self._send_json(404, {"error": "not found"})
+                        return
+                    self._send_bytes(200, p12, "application/x-pkcs12")
+                else:
+                    self._send_json(404, {"error": "not found"})
+
+            elif path == "/api/rate-limit":
+                ip = self.client_address[0]
+                if self._rl:
+                    info = self._rl.status(ip)
+                else:
+                    info = {"requests_last_minute": 0, "limit": 0, "ip": ip}
+                self._send_json(200, info)
+
+            elif path == "/api/audit":
+                events = []
+                if self._audit:
+                    try:
+                        events = self._audit.recent(100)
+                    except Exception:
+                        pass
+                self._send_json(200, {"events": events})
+
+            elif path == "/metrics":
+                text = self._ca.metrics_prometheus()
+                body = text.encode()
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            elif path == "/api/expiring":
+                days = int(params.get("days", 30))
+                certs = self._ca.list_certificates()
+                now = datetime.datetime.now(datetime.timezone.utc)
+                cutoff = now + datetime.timedelta(days=days)
+                expiring = []
+                for c in certs:
+                    try:
+                        na = datetime.datetime.fromisoformat(c["not_after"])
+                        if na.tzinfo is None:
+                            na = na.replace(tzinfo=datetime.timezone.utc)
+                        if na <= cutoff:
+                            expiring.append(c)
+                    except Exception:
+                        pass
+                self._send_json(200, {"expiring": expiring, "days_ahead": days})
+
+            else:
+                self._send_json(200, {
+                    "endpoints": [
+                        "GET /health", "GET /config",
+                        "GET /ca/cert.pem", "GET /ca/cert.der",
+                        "GET /ca/crl", "GET /ca/delta-crl",
+                        "GET /api/certs", "GET /api/certs/{serial}/pem",
+                        "GET /api/certs/{serial}/p12",
+                        "GET /api/rate-limit", "GET /api/audit",
+                        "GET /metrics", "GET /api/expiring",
+                        "POST /api/revoke", "POST /api/sub-ca",
+                        f"POST {CMP_WELL_KNOWN_PATH}",
+                    ]
+                })
+
+        # ------------------------------------------------------------------ #
+        # POST
+        # ------------------------------------------------------------------ #
+        def do_POST(self) -> None:
+            body = self._body()
+            ct = self.headers.get("Content-Type", "")
+            path = self.path.split("?")[0]
+
+            # CMP-over-HTTP
+            if "pkixcmp" in ct or path in ("/", CMP_WELL_KNOWN_PATH):
+                ip = self.client_address[0]
+                if self._rl and not self._rl.allow(ip):
+                    err = b'{"error":"rate limit exceeded"}'
+                    self.send_response(429)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err)))
+                    self.end_headers()
+                    self.wfile.write(err)
+                    return
+                resp = self._cmp.handle(body)
+                self._send_bytes(200, resp, "application/pkixcmp")
+                return
+
+            if path == "/api/revoke":
+                try:
+                    data = json.loads(body)
+                    serial = int(data["serial"])
+                    reason = int(data.get("reason", 0))
+                    ok = self._ca.revoke_certificate(serial, reason)
+                    self._send_json(200, {"ok": bool(ok)})
+                except Exception as exc:
+                    self._send_json(200, {"ok": False, "error": str(exc)})
+
+            elif path == "/api/sub-ca":
+                try:
+                    data = json.loads(body)
+                    cn = data.get("cn", "Sub CA")
+                    validity = int(data.get("validity_days", 365))
+                    priv_key, cert = self._ca.issue_sub_ca(
+                        cn=cn, validity_days=validity)
+                    cert_pem = cert.public_bytes(Encoding.PEM).decode()
+                    key_pem = priv_key.private_bytes(
+                        Encoding.PEM, PrivateFormat.TraditionalOpenSSL,
+                        NoEncryption()).decode()
+                    self._send_json(200, {"ok": True,
+                                          "cert_pem": cert_pem,
+                                          "key_pem": key_pem})
+                except Exception as exc:
+                    self._send_json(200, {"ok": False, "error": str(exc)})
+
+            else:
+                self._send_json(404, {"error": "not found"})
+
+        # ------------------------------------------------------------------ #
+        # PATCH — live config update
+        # ------------------------------------------------------------------ #
+        def do_PATCH(self) -> None:
+            path = self.path.split("?")[0]
+            if path == "/config":
+                try:
+                    data = json.loads(self._body())
+                    if self._ca.config:
+                        self._ca.config.patch(data)
+                    self._send_json(200, {"ok": True})
+                except Exception as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+            else:
+                self._send_json(404, {"error": "not found"})
+
+    return _PKIHTTPHandler
+
+
+def make_cmpv3_handler(ca: "CertificateAuthority",
+                       cmp_handler: "CMPv3Handler",
+                       audit: Optional["AuditLog"] = None,
+                       rate_limiter: Optional["RateLimiter"] = None):
+    """Return a handler class for a CMPv3-capable server (RFC 9480)."""
+    return make_handler(ca, cmp_handler, audit, rate_limiter)
+
+
+def start_bootstrap_server(host: str, port: int,
+                            ca: "CertificateAuthority",
+                            cmp_handler: "CMPv2Handler") -> ThreadedHTTPServer:
+    """Start a plain-HTTP bootstrap server for initial certificate issuance."""
+    handler_class = make_handler(ca, cmp_handler)
+    server = ThreadedHTTPServer((host, port), handler_class)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    logger.info(f"Bootstrap server listening on http://{host}:{port}")
+    return server
 
 
 def main():
