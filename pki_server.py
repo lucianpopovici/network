@@ -3265,6 +3265,18 @@ def main():
                 scep_base_url=_scep_base,
                 est_base_url=_est_base,
                 ocsp_base_url=_ocsp_base,
+                cmp_server=server,
+                acme_server=acme_srv,
+                scep_server=scep_srv,
+                est_server=est_srv,
+                ocsp_server=ocsp_srv,
+                ipsec_server=ipsec_srv,
+                cmp_module=_cmp_module if HAS_CMP else None,
+                acme_module=_acme_module if HAS_ACME else None,
+                scep_module=_scep_module if HAS_SCEP else None,
+                est_module=_est_module if HAS_EST else None,
+                ocsp_module=_ocsp_module if HAS_OCSP else None,
+                ipsec_module=_ipsec_module if HAS_IPSEC else None,
             )
 
     ca_mode_label = (
