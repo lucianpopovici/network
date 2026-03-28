@@ -53,17 +53,17 @@ Dependencies:
     pip install cryptography pyasn1 pyasn1-modules
 
 Usage:
-    # Plain HTTP (no mTLS)
+    # Plain HTTP (no mTLS) — all services on one port
     python pki_server.py [--host 0.0.0.0] [--port 8080] [--ca-dir ./ca]
 
     # mTLS enabled
     python pki_server.py --mtls --port 8443 [--ca-dir ./ca]
 
-    # mTLS + ACME on a second port
-    python pki_server.py --mtls --port 8443 --acme-port 8888 [--ca-dir ./ca]
+    # With ACME at /acme, SCEP at /scep
+    python pki_server.py --acme-prefix /acme --scep-prefix /scep [--ca-dir ./ca]
 
     # ACME with dns-01 auto-approve (testing/internal CA only)
-    python pki_server.py --acme-port 8888 --acme-auto-approve-dns
+    python pki_server.py --acme-prefix /acme --acme-auto-approve-dns
 """
 
 import argparse
@@ -117,42 +117,42 @@ from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as sym_padding
 
-# ACME server module (optional — loaded if --acme-port is specified)
+# ACME server module (optional — loaded if --acme-prefix is specified)
 try:
     import acme_server as _acme_module
     HAS_ACME = True
 except ImportError:
     HAS_ACME = False
 
-# SCEP server module (optional — loaded if --scep-port is specified)
+# SCEP server module (optional — loaded if --scep-prefix is specified)
 try:
     import scep_server as _scep_module
     HAS_SCEP = True
 except ImportError:
     HAS_SCEP = False
 
-# EST server module (optional — loaded if --est-port is specified)
+# EST server module (optional — loaded if --est-prefix is specified)
 try:
     import est_server as _est_module
     HAS_EST = True
 except ImportError:
     HAS_EST = False
 
-# OCSP responder module (optional — loaded if --ocsp-port is specified)
+# OCSP responder module (optional — loaded if --ocsp-prefix is specified)
 try:
     import ocsp_server as _ocsp_module
     HAS_OCSP = True
 except ImportError:
     HAS_OCSP = False
 
-# Web UI module (optional — loaded if --web-port is specified)
+# Web UI module (optional — loaded if --web-prefix is specified)
 try:
     import web_ui as _web_ui_module
     HAS_WEBUI = True
 except ImportError:
     HAS_WEBUI = False
 
-# IPsec PKI module (optional — loaded if --ipsec-port is specified)
+# IPsec PKI module (optional — loaded if --ipsec-prefix is specified)
 # RFC 4945 (IPsec cert profile) + RFC 4806 (OCSP hash/IKEv2) + RFC 4809 (requirements)
 try:
     import ipsec_server as _ipsec_module
@@ -2741,6 +2741,8 @@ def main():
     parser = argparse.ArgumentParser(description="PKI Server with CMPv2 Support + mTLS")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
+    parser.add_argument("--cmp-prefix", default="/cmp", metavar="PREFIX",
+                        help="Path prefix for CMP handler (default: /cmp)")
     parser.add_argument("--ca-dir", default="./ca", help="CA data directory (default: ./ca)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument(
@@ -2836,12 +2838,12 @@ def main():
         "Requires acme_server.py in the same directory."
     )
     acme_group.add_argument(
-        "--acme-port", type=int, default=None, metavar="PORT",
-        help="Start ACME server on this port (e.g. 8888)"
+        "--acme-prefix", default=None, metavar="PREFIX",
+        help="Mount ACME server at this path prefix (e.g. /acme)"
     )
     acme_group.add_argument(
         "--acme-base-url", default=None, metavar="URL",
-        help="Public base URL for ACME (default: http://<host>:<acme-port>)"
+        help="Public base URL for ACME (default: http://<host>:<port><acme-prefix>)"
     )
     acme_group.add_argument(
         "--acme-auto-approve-dns", action="store_true",
@@ -2861,8 +2863,8 @@ def main():
         "Revocation & PKI infrastructure",
     )
     infra_group.add_argument(
-        "--ocsp-port", type=int, default=None, metavar="PORT",
-        help="Start OCSP responder on this port (e.g. 8082)"
+        "--ocsp-prefix", default=None, metavar="PREFIX",
+        help="Mount OCSP responder at this path prefix (e.g. /ocsp)"
     )
     infra_group.add_argument(
         "--ocsp-url", default="", metavar="URL",
@@ -2881,8 +2883,8 @@ def main():
 
     ops_group = parser.add_argument_group("Operational options")
     ops_group.add_argument(
-        "--web-port", type=int, default=None, metavar="PORT",
-        help="Start web dashboard on this port (e.g. 8090)"
+        "--web-prefix", default=None, metavar="PREFIX",
+        help="Mount web dashboard at this path prefix (e.g. /)"
     )
     ops_group.add_argument(
         "--web-no-auth", action="store_true", default=False,
@@ -2893,8 +2895,8 @@ def main():
         help="PAM service name used for web dashboard login (default: login)"
     )
     ops_group.add_argument(
-        "--ipsec-port", type=int, default=None, metavar="PORT",
-        help="Start IPsec PKI server on this port (RFC 4945/4806/4809, auto-TLS from CA)"
+        "--ipsec-prefix", default=None, metavar="PREFIX",
+        help="Mount IPsec PKI server at this path prefix (e.g. /ipsec)"
     )
     ops_group.add_argument(
         "--ipsec-tls-cert", default=None, metavar="PATH",
@@ -2969,8 +2971,8 @@ def main():
         "a server cert is auto-issued from the CA if not provided."
     )
     est_group.add_argument(
-        "--est-port", type=int, default=None, metavar="PORT",
-        help="Start EST server on this port (e.g. 8443)"
+        "--est-prefix", default=None, metavar="PREFIX",
+        help="Mount EST server at this path prefix (e.g. /est)"
     )
     est_group.add_argument(
         "--est-user", action="append", metavar="USER:PASS",
@@ -2995,8 +2997,8 @@ def main():
         "Requires scep_server.py in the same directory."
     )
     scep_group.add_argument(
-        "--scep-port", type=int, default=None, metavar="PORT",
-        help="Start SCEP server on this port (e.g. 8889)"
+        "--scep-prefix", default=None, metavar="PREFIX",
+        help="Mount SCEP server at this path prefix (e.g. /scep)"
     )
     scep_group.add_argument(
         "--scep-challenge", default="", metavar="SECRET",
@@ -3126,22 +3128,33 @@ def main():
     if not alpn_protos:
         alpn_protos = [CertificateAuthority.ALPN_HTTP1]
 
-    server = _cmp_module.start_cmp_server(
+    import dispatcher_server as _dispatcher_module
+    route_table = _dispatcher_module.RouteTable()
+
+    # Start the single shared dispatcher server (all services share this port)
+    server = _dispatcher_module.start_dispatcher_server(
         host=args.host,
         port=args.port,
-        ca=ca,
-        audit_log=audit_log,
-        rate_limiter=rate_limiter,
-        use_cmpv3=getattr(args, "cmpv3", True),
+        route_table=route_table,
         tls_cert_path=cmp_tls_cert,
         tls_key_path=cmp_tls_key,
         require_client_cert=getattr(args, "mtls", False),
         tls13_only=getattr(args, "tls13_only", False),
         alpn_protocols=alpn_protos,
         tls_reload_interval=getattr(args, "tls_reload_interval", 60),
+        ca=ca,
+    )
+
+    _cmp_proxy = _cmp_module.start_cmp_server(
+        route_table=route_table,
+        prefix=getattr(args, "cmp_prefix", "/cmp"),
+        ca=ca,
+        audit_log=audit_log,
+        rate_limiter=rate_limiter,
+        use_cmpv3=getattr(args, "cmpv3", True),
     )
     proto_label = "CMPv3 (RFC 9480)" if getattr(args, "cmpv3", True) else "CMPv2 (RFC 4210)"
-    logger.info(f"{proto_label} active on {scheme}://{args.host}:{args.port}")
+    logger.info(f"{proto_label} active on {scheme}://{args.host}:{args.port}{getattr(args, 'cmp_prefix', '/cmp')}")
 
     bootstrap_srv = None
     if args.bootstrap_port:
@@ -3152,11 +3165,12 @@ def main():
 
     # Start ACME server if requested
     acme_srv = None
-    if args.acme_port:
+    if getattr(args, "acme_prefix", None):
         if not HAS_ACME:
             print("WARNING: acme_server.py not found — ACME support disabled.")
             print("         Place acme_server.py in the same directory as pki_server.py.")
         else:
+            _acme_prefix = args.acme_prefix
             # Use tls_hostname (or localhost) instead of 0.0.0.0 for the ACME base URL
             # so directory URLs are reachable by clients (0.0.0.0 is a bind addr, not a hostname)
             _acme_hostname = (
@@ -3166,10 +3180,10 @@ def main():
                 if args.host in ("0.0.0.0", "::")
                 else args.host
             )
-            acme_base = args.acme_base_url or f"http://{_acme_hostname}:{args.acme_port}"
+            acme_base = args.acme_base_url or f"{scheme}://{_acme_hostname}:{args.port}{_acme_prefix}"
             acme_srv = _acme_module.start_acme_server(
-                host=args.host,
-                port=args.acme_port,
+                route_table=route_table,
+                prefix=_acme_prefix,
                 ca=ca,
                 ca_dir=ca_dir,
                 auto_approve_dns=args.acme_auto_approve_dns,
@@ -3181,14 +3195,14 @@ def main():
 
     # Start SCEP server if requested
     scep_srv = None
-    if args.scep_port:
+    if getattr(args, "scep_prefix", None):
         if not HAS_SCEP:
             print("WARNING: scep_server.py not found — SCEP support disabled.")
             print("         Place scep_server.py in the same directory as pki_server.py.")
         else:
             scep_srv = _scep_module.start_scep_server(
-                host=args.host,
-                port=args.scep_port,
+                route_table=route_table,
+                prefix=args.scep_prefix,
                 ca=ca,
                 ca_dir=ca_dir,
                 challenge=args.scep_challenge,
@@ -3196,7 +3210,7 @@ def main():
 
     # Start EST server if requested
     est_srv = None
-    if args.est_port:
+    if getattr(args, "est_prefix", None):
         if not HAS_EST:
             print("WARNING: est_server.py not found — EST support disabled.")
             print("         Place est_server.py in the same directory as pki_server.py.")
@@ -3206,86 +3220,81 @@ def main():
                 u, _, p = entry.partition(":")
                 est_users[u] = p
             est_srv = _est_module.start_est_server(
-                host=args.host,
-                port=args.est_port,
+                route_table=route_table,
+                prefix=args.est_prefix,
                 ca=ca,
                 ca_dir=ca_dir,
                 users=est_users if est_users else None,
                 require_auth=args.est_require_auth,
-                tls_cert_path=args.est_tls_cert,
-                tls_key_path=args.est_tls_key,
-                tls_reload_interval=getattr(args, "tls_reload_interval", 60),
             )
 
     # Start OCSP responder if requested
     ocsp_srv = None
-    if getattr(args, "ocsp_port", None):
+    if getattr(args, "ocsp_prefix", None):
         if not HAS_OCSP:
             print("WARNING: ocsp_server.py not found — OCSP support disabled.")
         else:
             ocsp_srv = _ocsp_module.start_ocsp_server(
-                host=args.host,
-                port=args.ocsp_port,
+                route_table=route_table,
+                prefix=args.ocsp_prefix,
                 ca=ca,
                 cache_seconds=getattr(args, "ocsp_cache_seconds", 300),
             )
 
     # Start IPsec PKI server if requested (RFC 4945 / RFC 4806 / RFC 4809)
     ipsec_srv = None
-    if getattr(args, "ipsec_port", None):
+    if getattr(args, "ipsec_prefix", None):
         if not HAS_IPSEC:
             print("WARNING: ipsec_server.py not found — IPsec PKI server disabled.")
         else:
-            _ipsec_ocsp_url  = getattr(args, "ocsp_url", None) or None
-            _ipsec_crl_url   = getattr(args, "crl_url",  None) or None
-            _ipsec_tls_cert  = getattr(args, "ipsec_tls_cert", None) or None
-            _ipsec_tls_key   = getattr(args, "ipsec_tls_key",  None) or None
+            _ipsec_ocsp_url = getattr(args, "ocsp_url", None) or None
+            _ipsec_crl_url  = getattr(args, "crl_url",  None) or None
             ipsec_srv = _ipsec_module.start_ipsec_server(
-                host=args.host,
-                port=args.ipsec_port,
+                route_table=route_table,
+                prefix=args.ipsec_prefix,
                 ca=ca,
                 ocsp_url=_ipsec_ocsp_url,
                 crl_url=_ipsec_crl_url,
-                tls_cert_path=_ipsec_tls_cert,
-                tls_key_path=_ipsec_tls_key,
             )
 
     # Start Web UI if requested
     web_srv = None
-    if getattr(args, "web_port", None):
+    if getattr(args, "web_prefix", None):
         if not HAS_WEBUI:
             print("WARNING: web_ui.py not found — Web UI disabled.")
         else:
-            _ocsp_base = f"http://{args.host}:{args.ocsp_port}" if getattr(args, "ocsp_port", None) else ""
-            _acme_base2 = f"http://{args.host}:{args.acme_port}/acme/directory" if getattr(args, "acme_port", None) else ""
-            _scep_base = f"http://{args.host}:{args.scep_port}/scep" if getattr(args, "scep_port", None) else ""
-            _est_base  = f"https://{args.host}:{args.est_port}/.well-known/est" if getattr(args, "est_port", None) else ""
+            _dispatcher_base = f"{scheme}://{args.host}:{args.port}"
+            _ocsp_base  = f"{_dispatcher_base}{args.ocsp_prefix}"  if getattr(args, "ocsp_prefix",  None) else ""
+            _acme_base2 = f"{_dispatcher_base}{args.acme_prefix}/directory" if getattr(args, "acme_prefix", None) else ""
+            _scep_base  = f"{_dispatcher_base}{args.scep_prefix}"  if getattr(args, "scep_prefix",  None) else ""
+            _est_base   = f"{_dispatcher_base}{args.est_prefix}/.well-known/est" if getattr(args, "est_prefix",  None) else ""
             web_srv = _web_ui_module.start_web_ui(
-                host=args.host,
-                port=args.web_port,
+                route_table=route_table,
+                prefix=args.web_prefix,
                 ca=ca,
                 audit_log=audit_log,
                 rate_limiter=rate_limiter,
                 require_auth=not getattr(args, "web_no_auth", False),
                 pam_service=getattr(args, "web_pam_service", "login"),
-                cmp_base_url=f"{scheme}://{args.host}:{args.port}",
+                dispatcher_base_url=_dispatcher_base,
+                cmp_base_url=f"{_dispatcher_base}{getattr(args, 'cmp_prefix', '/cmp')}",
                 acme_base_url=_acme_base2,
                 scep_base_url=_scep_base,
                 est_base_url=_est_base,
                 ocsp_base_url=_ocsp_base,
                 # Running server objects — let the UI reflect current state
-                cmp_server=server,
+                cmp_server=_cmp_proxy,
                 acme_server=acme_srv,
                 scep_server=scep_srv,
                 est_server=est_srv,
                 ocsp_server=ocsp_srv,
                 ipsec_server=ipsec_srv,
                 # Module references — required for start/stop from the Services page
-                cmp_module=_cmp_module   if HAS_CMP   else None,
-                acme_module=_acme_module if HAS_ACME  else None,
-                scep_module=_scep_module if HAS_SCEP  else None,
-                est_module=_est_module   if HAS_EST   else None,
-                ocsp_module=_ocsp_module if HAS_OCSP  else None,
+                cmp_module=_cmp_module     if HAS_CMP   else None,
+                acme_module=_acme_module   if HAS_ACME  else None,
+                scep_module=_scep_module   if HAS_SCEP  else None,
+                est_module=_est_module     if HAS_EST   else None,
+                ocsp_module=_ocsp_module   if HAS_OCSP  else None,
                 ipsec_module=_ipsec_module if HAS_IPSEC else None,
             )
 
@@ -3293,13 +3302,15 @@ def main():
         f"intermediate ({len(ca._parent_chain)} parent cert(s))"
         if ca.is_intermediate else "root (self-signed)"
     )
-    acme_line = f"http://{args.host}:{args.acme_port}/acme/directory" if (args.acme_port and HAS_ACME) else "disabled"
-    scep_line = f"http://{args.host}:{args.scep_port}/scep" if (args.scep_port and HAS_SCEP) else "disabled"
-    est_line  = f"https://{args.host}:{args.est_port}/.well-known/est" if (args.est_port and HAS_EST) else "disabled"
-    ocsp_line = f"http://{args.host}:{args.ocsp_port}/ocsp" if (getattr(args,"ocsp_port",None) and HAS_OCSP) else "disabled"
-    web_line  = f"http://{args.host}:{args.web_port}" if getattr(args,"web_port",None) else "disabled"
-    ipsec_line = f"https://{args.host}:{args.ipsec_port}/ipsec" if (getattr(args,"ipsec_port",None) and HAS_IPSEC) else "disabled"
-    cmp_wk    = f"{scheme}://{args.host}:{args.port}/.well-known/cmp"
+    _base     = f"{scheme}://{args.host}:{args.port}"
+    _cmp_pfx  = getattr(args, "cmp_prefix", "/cmp")
+    acme_line = f"{_base}{args.acme_prefix}/directory" if (getattr(args,"acme_prefix",None) and HAS_ACME) else "disabled"
+    scep_line = f"{_base}{args.scep_prefix}" if (getattr(args,"scep_prefix",None) and HAS_SCEP) else "disabled"
+    est_line  = f"{_base}{args.est_prefix}/.well-known/est" if (getattr(args,"est_prefix",None) and HAS_EST) else "disabled"
+    ocsp_line = f"{_base}{args.ocsp_prefix}" if (getattr(args,"ocsp_prefix",None) and HAS_OCSP) else "disabled"
+    web_line  = f"{_base}{args.web_prefix}" if getattr(args,"web_prefix",None) else "disabled"
+    ipsec_line = f"{_base}{args.ipsec_prefix}" if (getattr(args,"ipsec_prefix",None) and HAS_IPSEC) else "disabled"
+    cmp_wk    = f"{_base}/.well-known/cmp"
     rl_info   = f"{args.rate_limit}/min per IP" if getattr(args,"rate_limit",0) > 0 else "disabled"
     _tls_reload_interval = getattr(args, "tls_reload_interval", 60)
     tls_reload_info = (f"{_tls_reload_interval}s poll + POST /api/reload-tls"
@@ -3309,61 +3320,45 @@ def main():
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
-║         PyPKI CMPv2 + ACME Server (RFC 4210 / RFC 8555 + TLS)  ║
+║         PyPKI — Single-Port PKI Server (path-prefix routing)   ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Listening (CMPv2): {scheme}://{args.host}:{args.port:<32}║
-║  Listening (ACME) : {acme_line:<47}║
+║  Listening on     : {scheme}://{args.host}:{args.port:<32}║
 ║  CA Dir           : {args.ca_dir:<47}║
 ║  CA Mode          : {ca_mode_label:<47}║
 ║  TLS Mode         : {tls_mode_label:<47}║
 ║  Bootstrap        : {boot_line:<47}║
-║  Listening (SCEP) : {scep_line:<47}║
-║  Listening (EST)  : {est_line:<47}║
-║  Listening (OCSP) : {ocsp_line:<47}║
-║  Web Dashboard    : {web_line:<47}║
+╠══════════════════════════════════════════════════════════════════╣
+║  CMP ({proto_label:<10}): {_base}{_cmp_pfx:<{27-len(_cmp_pfx)}}║
+║  ACME             : {acme_line:<47}║
+║  SCEP             : {scep_line:<47}║
+║  EST              : {est_line:<47}║
+║  OCSP             : {ocsp_line:<47}║
 ║  IPsec PKI        : {ipsec_line:<47}║
+║  Web Dashboard    : {web_line:<47}║
+╠══════════════════════════════════════════════════════════════════╣
 ║  CMP Well-Known   : {cmp_wk:<47}║
+║  Config           : GET/PATCH {_base}{_cmp_pfx}/api/config      ║
+║  CA Certificate   : GET  {_base}{_cmp_pfx}/ca/cert.pem          ║
+║  CRL              : GET  {_base}{_cmp_pfx}/ca/crl               ║
+║  Health Check     : GET  {_base}{_cmp_pfx}/health               ║
+║  Metrics          : GET  {_base}{_cmp_pfx}/metrics              ║
+╠══════════════════════════════════════════════════════════════════╣
 ║  Rate Limiting    : {rl_info:<47}║
 ║  Audit Log        : {audit_info:<47}║
-║  Metrics          : {scheme}://{args.host}:{args.port}/metrics                      ║
 ║  Expiry Monitor   : {str(_expiry_days)+"d" if _expiry_days else "disabled":<47}║
 ║  TLS Cert Reload  : {tls_reload_info:<47}║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Validity periods (change live: PATCH /config)                  ║
+║  Validity periods (change live: PATCH {_cmp_pfx}/api/config)    ║
 ║    End-entity   : {config.end_entity_days:<3} days                                       ║
 ║    Client cert  : {config.client_cert_days:<3} days                                       ║
 ║    TLS server   : {config.tls_server_days:<3} days                                       ║
 ║    CA cert      : {config.ca_days:<4} days                                      ║
-╠══════════════════════════════════════════════════════════════════╣
-║  CMPv2 Endpoint  : POST {scheme}://{args.host}:{args.port}/           ║
-║  ACME Directory  : GET  {acme_line:<40}║
-║  SCEP Endpoint   : {scep_line:<48}║
-║  Config          : GET/PATCH {scheme}://{args.host}:{args.port}/config ║
-║  CA Certificate  : GET  {scheme}://{args.host}:{args.port}/ca/cert.pem ║
-║  CRL             : GET  {scheme}://{args.host}:{args.port}/ca/crl      ║
-║  Health Check    : GET  {scheme}://{args.host}:{args.port}/health      ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Supported CMPv2/CMPv3 operations:                              ║
-║    ir, cr, kur, rr, certConf, genm, p10cr (CMPv2 / RFC 4210)   ║
-║    pollReq/pollRep - extended polling (CMPv3 / RFC 9480)        ║
-║    genm GetCACerts, GetRootCACertUpdate, GetCertReqTemplate     ║
-║    Well-known URI: POST/GET /.well-known/cmp[/p/<label>]        ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Supported ACME operations (RFC 8555 + RFC 9608):              ║
-║    new-account, new-order, http-01, dns-01, finalize, revoke   ║
-║    noRevAvail (RFC 9608) auto-applied to short-lived certs     ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Supported SCEP operations (RFC 8894):                          ║
-║    GetCACaps, GetCACert, PKCSReq, CertPoll, GetCert, GetCRL    ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Supported EST operations (RFC 7030):                           ║
-║    cacerts, simpleenroll, simplereenroll, csrattrs, serverkeygen║
 ╚══════════════════════════════════════════════════════════════════╝
 """)
 
     if args.tls:
         print("  TLS Quick-start:")
-        print(f"     curl --cacert {args.ca_dir}/ca.crt {scheme}://{args.tls_hostname}:{args.port}/health")
+        print(f"     curl --cacert {args.ca_dir}/ca.crt {scheme}://{args.tls_hostname}:{args.port}{_cmp_pfx}/health")
         print()
 
     if args.mtls:
@@ -3373,33 +3368,33 @@ def main():
         print(f"  2. Split bundle: openssl x509 -in bundle.pem -out client.crt")
         print(f"                   openssl pkey -in bundle.pem -out client.key")
         print(f"  3. curl --cert client.crt --key client.key --cacert {args.ca_dir}/ca.crt \\")
-        print(f"          {scheme}://{args.tls_hostname}:{args.port}/health")
+        print(f"          {scheme}://{args.tls_hostname}:{args.port}{_cmp_pfx}/health")
         print()
 
-    if args.est_port and HAS_EST:
+    if getattr(args, "est_prefix", None) and HAS_EST:
         print("  EST Quick-start (RFC 7030):")
         print(f"  1. Get CA chain:  curl --cacert {args.ca_dir}/ca.crt \\")
-        print(f"                       https://{args.host}:{args.est_port}/.well-known/est/cacerts | base64 -d > chain.p7")
+        print(f"                       {_base}{args.est_prefix}/.well-known/est/cacerts | base64 -d > chain.p7")
         print(f"  2. Enrol (openssl):")
         print(f"     openssl req -new -key client.key -out client.csr -subj '/CN=mydevice'")
         print(f"     curl -X POST --cacert {args.ca_dir}/ca.crt \\")
         print(f"          --data-binary @<(base64 client.csr) \\")
         print(f"          -H 'Content-Transfer-Encoding: base64' \\")
-        print(f"          https://{args.host}:{args.est_port}/.well-known/est/simpleenroll")
+        print(f"          {_base}{args.est_prefix}/.well-known/est/simpleenroll")
         if args.est_require_auth:
             print(f"     Add: -u 'username:password'")
         print()
 
-    if args.scep_port and HAS_SCEP:
+    if getattr(args, "scep_prefix", None) and HAS_SCEP:
         print("  SCEP Quick-start:")
-        print(f"  1. Fetch CA cert:  sscep getca -u http://{args.host}:{args.scep_port}/scep -c ca.crt")
-        print(f"  2. Enrol:          sscep enroll -u http://{args.host}:{args.scep_port}/scep \\")
+        print(f"  1. Fetch CA cert:  sscep getca -u {_base}{args.scep_prefix} -c ca.crt")
+        print(f"  2. Enrol:          sscep enroll -u {_base}{args.scep_prefix} \\")
         print(f"                       -c ca.crt -k client.key -r client.csr -l client.crt \\")
         if args.scep_challenge:
             print(f"                       -p '{args.scep_challenge}'")
         print()
 
-    if args.acme_port and HAS_ACME:
+    if getattr(args, "acme_prefix", None) and HAS_ACME:
         print("  ACME Quick-start:")
         print(f"  1. Fetch directory:    curl {acme_line}")
         print(f"  2. Use any ACME client (certbot, acme.sh, custom) pointed at:")
@@ -3410,43 +3405,23 @@ def main():
             print(f"  ⚠ dns-01 auto-approval is ON — do not use in production!")
         print()
 
-    if 'est_srv' not in dir():
-        est_srv = None
-    if 'ocsp_srv' not in dir():
-        ocsp_srv = None
-    if 'web_srv' not in dir():
-        web_srv = None
-
-    # Collect all servers that may have a TLS watcher to stop on shutdown
-    _tls_servers = [s for s in [server, est_srv, ipsec_srv] if s is not None]
+    if 'bootstrap_srv' not in dir():
+        bootstrap_srv = None
 
     try:
-        # CMP server runs in its own daemon thread (started by start_cmp_server).
+        # Dispatcher server runs in its own daemon thread.
         # Block the main thread here so the process stays alive.
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nShutting down PKI server...")
-        # Stop TLS cert watchers first so they don't log spurious errors
-        for _srv in _tls_servers:
-            _w = getattr(_srv, "_tls_watcher", None)
-            if _w is not None:
-                _w.stop()
+        # Stop TLS cert watcher on the dispatcher server
+        _w = getattr(server, "_tls_watcher", None)
+        if _w is not None:
+            _w.stop()
         server.shutdown()
         if bootstrap_srv:
             bootstrap_srv.shutdown()
-        if acme_srv:
-            acme_srv.shutdown()
-        if scep_srv:
-            scep_srv.shutdown()
-        if est_srv:
-            est_srv.shutdown()
-        if ocsp_srv:
-            ocsp_srv.shutdown()
-        if ipsec_srv:
-            ipsec_srv.shutdown()
-        if web_srv:
-            web_srv.shutdown()
         if audit_log:
             audit_log.record("shutdown", "graceful shutdown via KeyboardInterrupt")
 

@@ -220,27 +220,25 @@ class ServiceManager:
     # type is one of: "number", "text", "password", "checkbox", "select"
     SERVICE_CONFIG_SCHEMA: Dict[str, List[Dict[str, Any]]] = {
         "cmp": [
-            {"key": "port", "label": "Port", "type": "number", "min": 1, "max": 65535},
+            {"key": "prefix", "label": "Path prefix", "type": "text"},
         ],
         "acme": [
-            {"key": "port",                      "label": "Port",                         "type": "number",   "min": 1, "max": 65535},
+            {"key": "prefix",                     "label": "Path prefix",                  "type": "text"},
             {"key": "cert_validity_days",         "label": "Cert validity (days)",         "type": "number",   "min": 1},
             {"key": "short_lived_threshold_days", "label": "Short-lived threshold (days)", "type": "number",   "min": 1},
             {"key": "auto_approve_dns",           "label": "Auto-approve DNS challenges",  "type": "checkbox"},
             {"key": "base_url",                   "label": "Public base URL",              "type": "text"},
         ],
         "scep": [
-            {"key": "port",      "label": "Port",             "type": "number",   "min": 1, "max": 65535},
+            {"key": "prefix",    "label": "Path prefix",      "type": "text"},
             {"key": "challenge", "label": "Challenge secret", "type": "password"},
         ],
         "est": [
-            {"key": "port",          "label": "Port",                     "type": "number",   "min": 1, "max": 65535},
-            {"key": "require_auth",  "label": "Require authentication",   "type": "checkbox"},
-            {"key": "tls_cert_path", "label": "TLS cert path (optional)", "type": "text"},
-            {"key": "tls_key_path",  "label": "TLS key path (optional)",  "type": "text"},
+            {"key": "prefix",       "label": "Path prefix",             "type": "text"},
+            {"key": "require_auth", "label": "Require authentication",  "type": "checkbox"},
         ],
         "ocsp": [
-            {"key": "port",          "label": "Port",                "type": "number", "min": 1, "max": 65535},
+            {"key": "prefix",        "label": "Path prefix",         "type": "text"},
             {"key": "cache_seconds", "label": "Cache TTL (seconds)", "type": "number", "min": 1},
         ],
     }

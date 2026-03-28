@@ -1533,7 +1533,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": f"Internal server error: {e}"}, 500)
 
     def _do_GET(self, path: str):
-        if path == "/ipsec/health":
+        if path == "/health":
             # Include RFC 4945 §5.2 CDP reachability advisory in health response
             cdp_status = {}
             if self.crl_url:
@@ -1576,14 +1576,14 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
                 },
             })
 
-        elif path == "/ipsec/ca-cert":
+        elif path == "/ca-cert":
             # RFC 4809 §3.1.3 (b): allow Peer to retrieve root cert from Admin.
             # For intermediate CA mode we return the full chain PEM so the peer
             # can verify certificates up to the trust anchor it already holds.
             pem = self.ca.ca_chain_pem
             self._send_raw(200, pem, "application/x-pem-file")
 
-        elif path == "/ipsec/profiles":
+        elif path == "/profiles":
             self._send_json({
                 "profiles": {
                     "ipsec_tunnel": {
@@ -1607,8 +1607,8 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
                 }
             })
 
-        elif path.startswith("/ipsec/cert/"):
-            serial_str = path[len("/ipsec/cert/"):]
+        elif path.startswith("/cert/"):
+            serial_str = path[len("/cert/"):]
             try:
                 serial = int(serial_str)
             except ValueError:
@@ -1631,13 +1631,13 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             pem = cert.public_bytes(Encoding.PEM)
             self._send_raw(200, pem, "application/x-pem-file")
 
-        elif path.startswith("/ipsec/ocsp-hash/"):
-            # RFC 4806 GET variant: /ipsec/ocsp-hash/<issuer_hash_hex>/<serial_hex>
-            rest = path[len("/ipsec/ocsp-hash/"):]
+        elif path.startswith("/ocsp-hash/"):
+            # RFC 4806 GET variant: /ocsp-hash/<issuer_hash_hex>/<serial_hex>
+            rest = path[len("/ocsp-hash/"):]
             parts = rest.split("/")
             if len(parts) < 2:
                 self._send_json(
-                    {"error": "Expected /ipsec/ocsp-hash/<issuer_sha1_hex>/<serial_hex>"},
+                    {"error": "Expected /ocsp-hash/<issuer_sha1_hex>/<serial_hex>"},
                     400
                 )
                 return
@@ -1660,7 +1660,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(resp_der)
 
-        elif path == "/ipsec/pending":
+        elif path == "/pending":
             # RFC 4809 §3.4.4 — list all pending approval requests
             if self.approval_queue is None:
                 self._send_json({"error": "Approval queue not configured"}, 500)
@@ -1676,17 +1676,17 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
                         "requester_ip": r["requester_ip"],
                         "subject":      json.loads(r["request_json"]).get("subject", ""),
                         "profile":      json.loads(r["request_json"]).get("profile", ""),
-                        "approve_url":  f"/ipsec/approve/{r['request_id']}",
-                        "reject_url":   f"/ipsec/reject/{r['request_id']}",
+                        "approve_url":  f"/approve/{r['request_id']}",
+                        "reject_url":   f"/reject/{r['request_id']}",
                     }
                     for r in rows
                 ],
                 "rfc4809": "Pending approval queue per RFC 4809 §3.4.4",
             })
 
-        elif path.startswith("/ipsec/pending/"):
+        elif path.startswith("/pending/"):
             # RFC 4809 §3.4.4 — status of one pending request
-            request_id = path[len("/ipsec/pending/"):]
+            request_id = path[len("/pending/"):]
             if self.approval_queue is None:
                 self._send_json({"error": "Approval queue not configured"}, 500)
                 return
@@ -1714,23 +1714,23 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({
                 "error": "unknown endpoint",
                 "endpoints": {
-                    "GET  /ipsec/health":                    "liveness check",
-                    "GET  /ipsec/ca-cert":                   "CA cert PEM (RFC 4809 §3.1.3)",
-                    "GET  /ipsec/profiles":                  "IPsec certificate profiles",
-                    "GET  /ipsec/cert/<serial>":             "fetch cert by serial",
-                    "GET  /ipsec/ocsp-hash/<hash>/<serial>": "RFC 4806 cacheable OCSP GET",
-                    "GET  /ipsec/pending":                   "list pending approval requests (RFC 4809 §3.4.4)",
-                    "GET  /ipsec/pending/<id>":              "status of one pending request",
-                    "POST /ipsec/issue":                     "issue RFC 4945/4809 cert (add require_approval:true to queue)",
-                    "POST /ipsec/enroll":                    "PKCS#10 CSR enrollment (RFC 4809 §3.4.5)",
-                    "POST /ipsec/batch-issue":               "RFC 4809 §3.1.2 batch issuance",
-                    "POST /ipsec/update":                    "RFC 4809 §3.3 PKC Update — new key, same subject",
-                    "POST /ipsec/renew":                     "RFC 4809 §3.5 PKC Renew — same key, new validity",
-                    "POST /ipsec/revoke":                    "revoke an IPsec cert",
-                    "POST /ipsec/confirm":                   "enrollment confirmation (RFC 4809 §3.4.10)",
-                    "POST /ipsec/approve/<id>":              "approve a pending request (RFC 4809 §3.4.4)",
-                    "POST /ipsec/reject/<id>":               "reject a pending request (RFC 4809 §3.4.4)",
-                    "POST /ipsec/ocsp-hash":                 "RFC 4806 hash-based OCSP lookup",
+                    "GET  /health":                    "liveness check",
+                    "GET  /ca-cert":                   "CA cert PEM (RFC 4809 §3.1.3)",
+                    "GET  /profiles":                  "IPsec certificate profiles",
+                    "GET  /cert/<serial>":             "fetch cert by serial",
+                    "GET  /ocsp-hash/<hash>/<serial>": "RFC 4806 cacheable OCSP GET",
+                    "GET  /pending":                   "list pending approval requests (RFC 4809 §3.4.4)",
+                    "GET  /pending/<id>":              "status of one pending request",
+                    "POST /issue":                     "issue RFC 4945/4809 cert (add require_approval:true to queue)",
+                    "POST /enroll":                    "PKCS#10 CSR enrollment (RFC 4809 §3.4.5)",
+                    "POST /batch-issue":               "RFC 4809 §3.1.2 batch issuance",
+                    "POST /update":                    "RFC 4809 §3.3 PKC Update — new key, same subject",
+                    "POST /renew":                     "RFC 4809 §3.5 PKC Renew — same key, new validity",
+                    "POST /revoke":                    "revoke an IPsec cert",
+                    "POST /confirm":                   "enrollment confirmation (RFC 4809 §3.4.10)",
+                    "POST /approve/<id>":              "approve a pending request (RFC 4809 §3.4.4)",
+                    "POST /reject/<id>":               "reject a pending request (RFC 4809 §3.4.4)",
+                    "POST /ocsp-hash":                 "RFC 4806 hash-based OCSP lookup",
                 }
             }, 404)
 
@@ -1750,7 +1750,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
         client_ip = self.client_address[0]
 
         # ── POST /ipsec/issue ─────────────────────────────────────────────
-        if path == "/ipsec/issue":
+        if path == "/issue":
             subject = data.get("subject", "").strip()
             if not subject:
                 self._send_json({"error": "subject is required"}, 400)
@@ -1775,9 +1775,9 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
                     "pending":   True,
                     "request_id": request_id,
                     "message":   "Request queued for administrator approval (RFC 4809 §3.4.4)",
-                    "status_url": f"/ipsec/pending/{request_id}",
-                    "approve_url": f"/ipsec/approve/{request_id}",
-                    "reject_url":  f"/ipsec/reject/{request_id}",
+                    "status_url": f"/pending/{request_id}",
+                    "approve_url": f"/approve/{request_id}",
+                    "reject_url":  f"/reject/{request_id}",
                 }, 202)
                 return
 
@@ -1826,7 +1826,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(resp, 201)
 
         # ── POST /ipsec/batch-issue (RFC 4809 §3.1.2) ────────────────────
-        elif path == "/ipsec/batch-issue":
+        elif path == "/batch-issue":
             requests_list = data.get("requests", data if isinstance(data, list) else [])
             if not isinstance(requests_list, list) or not requests_list:
                 self._send_json(
@@ -1852,7 +1852,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             }, 200 if n_fail == 0 else 207)
 
         # ── POST /ipsec/update (RFC 4809 §3.3 PKC Update) ────────────────
-        elif path == "/ipsec/update":
+        elif path == "/update":
             old_serial = data.get("old_serial")
             if old_serial is None:
                 self._send_json({"error": "old_serial is required"}, 400)
@@ -1897,7 +1897,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(resp, 201)
 
         # ── POST /ipsec/renew (RFC 4809 §3.5 — same key, new validity) ───
-        elif path == "/ipsec/renew":
+        elif path == "/renew":
             old_serial = data.get("old_serial")
             if old_serial is None:
                 self._send_json({"error": "old_serial is required"}, 400)
@@ -1925,7 +1925,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             }, 201)
 
         # ── POST /ipsec/enroll (RFC 4809 §3.4.5 — PKCS#10 CSR) ──────────
-        elif path == "/ipsec/enroll":
+        elif path == "/enroll":
             csr_pem = (data.get("csr_pem") or "").strip()
             if not csr_pem:
                 self._send_json({
@@ -1994,9 +1994,9 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({
                     "ok": False, "pending": True, "request_id": request_id,
                     "message": "CSR enrollment queued for administrator approval (RFC 4809 §3.4.4)",
-                    "status_url":  f"/ipsec/pending/{request_id}",
-                    "approve_url": f"/ipsec/approve/{request_id}",
-                    "reject_url":  f"/ipsec/reject/{request_id}",
+                    "status_url":  f"/pending/{request_id}",
+                    "approve_url": f"/approve/{request_id}",
+                    "reject_url":  f"/reject/{request_id}",
                 }, 202)
                 return
             # Issue cert directly — private key never leaves the peer
@@ -2032,8 +2032,8 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(resp, 201)
 
         # ── POST /ipsec/approve/<id> (RFC 4809 §3.4.4) ───────────────────
-        elif path.startswith("/ipsec/approve/"):
-            request_id = path[len("/ipsec/approve/"):]
+        elif path.startswith("/approve/"):
+            request_id = path[len("/approve/"):]
             if not request_id:
                 self._send_json({"error": "request_id required in URL path"}, 400)
                 return
@@ -2089,8 +2089,8 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(resp, 201)
 
         # ── POST /ipsec/reject/<id> (RFC 4809 §3.4.4) ────────────────────
-        elif path.startswith("/ipsec/reject/"):
-            request_id = path[len("/ipsec/reject/"):]
+        elif path.startswith("/reject/"):
+            request_id = path[len("/reject/"):]
             if not request_id:
                 self._send_json({"error": "request_id required in URL path"}, 400)
                 return
@@ -2118,7 +2118,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             })
 
         # ── POST /ipsec/confirm (RFC 4809 §3.4.10 — enrollment confirmation) ─
-        elif path == "/ipsec/confirm":
+        elif path == "/confirm":
             """
             RFC 4809 §3.4.10 — Enrollment Confirmation Handshake.
 
@@ -2186,7 +2186,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             })
 
         # ── POST /ipsec/revoke ────────────────────────────────────────────
-        elif path == "/ipsec/revoke":
+        elif path == "/revoke":
             serial = data.get("serial")
             reason = int(data.get("reason", 0))
             if serial is None:
@@ -2240,7 +2240,7 @@ class IPsecHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(resp)
 
         # ── POST /ipsec/ocsp-hash (RFC 4806) ─────────────────────────────
-        elif path == "/ipsec/ocsp-hash":
+        elif path == "/ocsp-hash":
             issuer_hash_hex = data.get("issuer_cert_hash_hex", "").strip()
             serial          = data.get("serial")
             nonce_hex       = data.get("nonce_hex", "")
@@ -2487,62 +2487,28 @@ def _provision_ipsec_tls_cert(ca: "CertificateAuthority", hostname: str):
 # ---------------------------------------------------------------------------
 
 def start_ipsec_server(
-    host: str,
-    port: int,
+    route_table,
+    prefix: str,
     ca: "CertificateAuthority",
     ocsp_url: Optional[str] = None,
     crl_url: Optional[str] = None,
     tls_cert_path: Optional[str] = None,
     tls_key_path: Optional[str] = None,
-) -> http.server.HTTPServer:
+) -> "http.server.HTTPServer":
     """
-    Start the IPsec PKI server in a background thread. Returns the HTTPServer.
+    Register the IPsec handler with *route_table* under *prefix*.
 
-    TLS (RFC 4809 §3.1.2 — "Secure Transactions")
-    -----------------------------------------------
-    RFC 4809 §3.1.2 mandates that ALL VPN-PKI transactions must be
-    authenticated and encrypted.  TLS is the mechanism used here.
+    Returns a _RouteProxy whose .shutdown() unregisters the IPsec routes.
 
-    If tls_cert_path and tls_key_path are both supplied, those PEM files are
-    loaded directly.  Otherwise, a TLS server cert is auto-provisioned from
-    the CA (same as the EST server pattern in est_server.py).
-
-    The resulting server listens on HTTPS; use --ipsec-tls-cert and
-    --ipsec-tls-key in pki_server.py, or pass them here directly.
-
-    Without TLS, the server still starts (useful for unix-socket deployment or
-    development behind an mTLS-terminating proxy) but logs a WARNING on every
-    private-key response.
-
-    Called from pki_server.py:
-        srv = start_ipsec_server(host=args.host, port=args.ipsec_port, ca=ca,
-                                  ocsp_url=..., crl_url=...,
-                                  tls_cert_path=args.ipsec_tls_cert,
-                                  tls_key_path=args.ipsec_tls_key)
+    TLS note: TLS is now handled at the shared dispatcher server level.
+    The tls_cert_path and tls_key_path parameters are accepted for backwards
+    compatibility but are ignored; configure TLS globally via the dispatcher.
     """
+    from dispatcher_server import _RouteProxy
+
     ocsp_key, ocsp_cert = _provision_ipsec_ocsp_cert(ca)
     issuer        = IPsecCertIssuer(ca)
     ocsp_resolver = RFC4806OCSPHashResolver(ca, ocsp_key, ocsp_cert)
-
-    # Resolve TLS cert/key paths
-    use_tls = False
-    if tls_cert_path and tls_key_path:
-        cert_pem_path = str(tls_cert_path)
-        key_pem_path  = str(tls_key_path)
-        use_tls = True
-    else:
-        # Auto-provision an IPsec-server TLS cert from the CA
-        try:
-            auto_cert, auto_key = _provision_ipsec_tls_cert(ca, host)
-            cert_pem_path = str(auto_cert)
-            key_pem_path  = str(auto_key)
-            use_tls = True
-        except Exception as e:
-            logger.warning(
-                f"RFC 4809 §3.1.2: could not provision TLS cert ({e}). "
-                f"Starting in plain-HTTP mode — NOT suitable for production. "
-                f"Supply --ipsec-tls-cert / --ipsec-tls-key to enable TLS."
-            )
 
     class BoundHandler(IPsecHandler):
         pass
@@ -2556,91 +2522,16 @@ def start_ipsec_server(
     BoundHandler.approval_queue = aq
     BoundHandler.ocsp_url       = ocsp_url
     BoundHandler.crl_url        = crl_url
-    BoundHandler.tls_active     = use_tls
+    # tls_active reflects whether the shared dispatcher is running TLS —
+    # callers should set this after dispatcher startup if needed.
+    BoundHandler.tls_active     = bool(tls_cert_path and tls_key_path)
 
-    class _ThreadedServer(http.server.ThreadingHTTPServer):
-        allow_reuse_address = True
-        daemon_threads      = True
-
-    srv = _ThreadedServer((host, port), BoundHandler)
-
-    if use_tls:
-        from cmp_server import TLSContextHolder, TlsCertWatcher
-
-        def _build_ipsec_ctx(cp, kp):
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            ctx.options |= ssl.OP_NO_COMPRESSION
-            ctx.set_ciphers(
-                "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!eNULL:!RC4:!DES:!MD5"
-            )
-            ctx.load_cert_chain(certfile=cp, keyfile=kp)
-            # Accept (but don't require) client certs for mTLS
-            ctx.verify_mode = ssl.CERT_OPTIONAL
-            ctx.load_verify_locations(str(ca.ca_dir / "ca.crt"))
-            return ctx
-
-        tls_ctx = _build_ipsec_ctx(cert_pem_path, key_pem_path)
-        holder  = TLSContextHolder(tls_ctx)
-
-        # Rebuild server as a per-connection TLS server so the certificate
-        # can be hot-reloaded without restarting.
-        class _IPsecTLSServer(http.server.ThreadingHTTPServer):
-            allow_reuse_address = True
-            daemon_threads      = True
-            ctx_holder: TLSContextHolder = None
-
-            def get_request(self):
-                sock, addr = super().get_request()
-                try:
-                    tls_sock = self.ctx_holder.get().wrap_socket(sock, server_side=True)
-                    return tls_sock, addr
-                except ssl.SSLError as exc:
-                    logger.warning("IPsec TLS handshake failed from %s: %s", addr, exc)
-                    sock.close()
-                    raise
-
-        srv = _IPsecTLSServer((host, port), BoundHandler)
-        srv.ctx_holder = holder
-
-        tls_reload_interval = getattr(ca, "_tls_reload_interval", 60)
-        if tls_reload_interval > 0:
-            watcher = TlsCertWatcher(
-                holder=holder,
-                cert_path=cert_pem_path,
-                key_path=key_pem_path,
-                build_ctx=_build_ipsec_ctx,
-                poll_interval=tls_reload_interval,
-            ).start()
-            srv._tls_watcher = watcher
-        else:
-            srv._tls_watcher = None
-
-        def _reload_tls() -> bool:
-            if srv._tls_watcher:
-                return srv._tls_watcher.reload_now()
-            try:
-                holder.swap(_build_ipsec_ctx(cert_pem_path, key_pem_path))
-                logger.info("IPsec TLS context reloaded via reload_tls()")
-                return True
-            except Exception as exc:
-                logger.error("IPsec TLS reload failed: %s", exc)
-                return False
-
-        srv.reload_tls = _reload_tls
-        scheme = "https"
-    else:
-        srv._tls_watcher = None
-        srv.reload_tls   = lambda: False
-        scheme = "http"
-
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
+    route_table.register(prefix, BoundHandler)
     logger.info(
-        f"IPsec PKI server listening on {scheme}://{host}:{port}/ipsec "
-        f"(RFC 4945 + RFC 4806 + RFC 4809, TLS={'enabled' if use_tls else 'DISABLED'})"
+        f"IPsec PKI handler registered at prefix {prefix!r} "
+        f"(RFC 4945 + RFC 4806 + RFC 4809)"
     )
-    return srv
+    return _RouteProxy(route_table, prefix, label="ipsec")
 
 
 # ---------------------------------------------------------------------------

@@ -1,24 +1,25 @@
 {
   "_comment": "PyPKI startup configuration. Run with: python pypki.py",
   "host": "0.0.0.0",
+  "port": 8080,
   "ca_dir": "./ca",
   "log_level": "INFO",
 
   "cmp": {
-    "port": 8080,
-    "comment": "CMPv2/v3 main server — always started, cannot be disabled here"
+    "prefix": "/cmp",
+    "comment": "CMPv2/v3 main handler — always started, cannot be disabled here"
   },
 
   "web_ui": {
     "comment": "Web dashboard — always on",
-    "port": 8090,
+    "prefix": "/",
     "no_auth": false,
     "pam_service": "login"
   },
 
   "acme": {
     "enabled": false,
-    "port": 8888,
+    "prefix": "/acme",
     "cert_days": 90,
     "short_lived_threshold_days": 7,
     "auto_approve_dns": false,
@@ -27,30 +28,26 @@
 
   "scep": {
     "enabled": false,
-    "port": 8889,
+    "prefix": "/scep",
     "challenge": ""
   },
 
   "est": {
     "enabled": false,
-    "port": 8443,
-    "require_auth": true,
-    "tls_cert": "",
-    "tls_key": ""
+    "prefix": "/est",
+    "require_auth": true
   },
 
   "ocsp": {
     "enabled": true,
-    "port": 9001,
+    "prefix": "/ocsp",
     "cache_seconds": 300,
     "url": ""
   },
 
   "ipsec": {
     "enabled": false,
-    "port": 8444,
-    "tls_cert": "",
-    "tls_key": ""
+    "prefix": "/ipsec"
   },
 
   "tls": {

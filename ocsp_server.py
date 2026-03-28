@@ -527,9 +527,6 @@ class OCSPHandler(http.server.BaseHTTPRequestHandler):
         logger.debug(f"OCSP {self.client_address[0]} - {fmt % args}")
 
     def do_POST(self):
-        if not self.path.rstrip("/").startswith("/ocsp"):
-            self._send_raw(400, b"", "application/ocsp-response")
-            return
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
         response = self._handle_request(body)
@@ -537,12 +534,8 @@ class OCSPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
-        if not path.startswith("/ocsp/"):
-            self._send_raw(400, OCSPResponseBuilder.error(RESP_MALFORMED_REQUEST),
-                           "application/ocsp-response")
-            return
-
-        b64_part = path[len("/ocsp/"):]
+        # Accept both "/" (root, no b64) and "/<b64>" (GET binding per RFC 5019)
+        b64_part = path.lstrip("/")
         if not b64_part:
             self._send_raw(400, OCSPResponseBuilder.error(RESP_MALFORMED_REQUEST),
                            "application/ocsp-response")
@@ -646,12 +639,17 @@ class OCSPHandler(http.server.BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def start_ocsp_server(
-    host: str,
-    port: int,
+    route_table,
+    prefix: str,
     ca: "CertificateAuthority",
     cache_seconds: int = 300,
-) -> http.server.HTTPServer:
-    """Start OCSP responder in a background thread. Returns HTTPServer."""
+):
+    """
+    Register the OCSP handler with *route_table* under *prefix*.
+
+    Returns a _RouteProxy whose .shutdown() unregisters the OCSP routes.
+    """
+    from dispatcher_server import _RouteProxy
 
     ocsp_key, ocsp_cert = provision_ocsp_signing_cert(ca)
     cache = OCSPResponseCache(ttl_seconds=cache_seconds)
@@ -665,17 +663,9 @@ def start_ocsp_server(
     BoundOCSPHandler.cache = cache
     BoundOCSPHandler.cache_max_age = cache_seconds
 
-    import http.server as _hs
-
-    class _ThreadedServer(_hs.ThreadingHTTPServer):
-        allow_reuse_address = True
-        daemon_threads = True
-
-    srv = _ThreadedServer((host, port), BoundOCSPHandler)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    logger.info(f"OCSP responder listening on http://{host}:{port}/ocsp")
-    return srv
+    route_table.register(prefix, BoundOCSPHandler)
+    logger.info(f"OCSP handler registered at prefix {prefix!r}")
+    return _RouteProxy(route_table, prefix, label="ocsp")
 
 
 # ---------------------------------------------------------------------------
