@@ -735,7 +735,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def do_HEAD(self):
-        if self.path == "/acme/new-nonce":
+        if self.path == "/new-nonce":
             self._new_nonce_response(method="HEAD")
         else:
             self.send_response(405)
@@ -753,11 +753,11 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                 pass
 
     def _do_GET_inner(self, path: str):
-        if path in ("/acme/directory", ""):
+        if path in ("/directory", ""):
             self._handle_directory()
-        elif path == "/acme/new-nonce":
+        elif path == "/new-nonce":
             self._new_nonce_response(method="GET")
-        elif path == "/acme/terms":
+        elif path == "/terms":
             # Serve a minimal Terms of Service page so certbot can fetch it
             body = b"Terms of Service: This is an internal CA. Use at your own risk."
             self.send_response(200)
@@ -765,7 +765,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif path == "/acme/renewal-info" or path.startswith("/acme/renewal-info/"):
+        elif path == "/renewal-info" or path.startswith("/renewal-info/"):
             # draft-ietf-acme-ari — return 404 with proper JSON to signal not supported
             # certbot treats a 404 here as "no renewal info available" and continues
             self._send_error(404, "urn:ietf:params:acme:error:malformed",
@@ -778,7 +778,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
         # We return the resource without verifying account ownership, which
         # is acceptable for read-only status polling on non-sensitive data.
         # ------------------------------------------------------------------
-        elif re.match(r"^/acme/order/[^/]+$", path):
+        elif re.match(r"^/order/[^/]+$", path):
             order_id = path.split("/")[-1]
             order = self.db.get_order(order_id)
             if not order:
@@ -786,11 +786,11 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._refresh_order_status(order_id)
             order = self.db.get_order(order_id)
-            order_url = f"{self.base_url}/acme/order/{order_id}"
+            order_url = f"{self.base_url}/order/{order_id}"
             self._send_json(self._order_response(order), 200,
                             headers={"Location": order_url}, add_nonce=True)
 
-        elif re.match(r"^/acme/authz/[^/]+$", path):
+        elif re.match(r"^/authz/[^/]+$", path):
             auth_id = path.split("/")[-1]
             authz = self.db.get_authorization(auth_id)
             if not authz:
@@ -809,7 +809,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._send_json(self._authz_response(authz, account_rec), 200, add_nonce=True)
 
-        elif re.match(r"^/acme/cert/[^/]+$", path):
+        elif re.match(r"^/cert/[^/]+$", path):
             cert_id = path.split("/")[-1]
             cert_rec = self.db.get_certificate(cert_id)
             if not cert_rec:
@@ -830,25 +830,25 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.rstrip("/")
         try:
-            if path == "/acme/new-account":
+            if path == "/new-account":
                 self._handle_new_account()
-            elif path == "/acme/new-order":
+            elif path == "/new-order":
                 self._handle_new_order()
-            elif re.match(r"^/acme/order/[^/]+$", path):
+            elif re.match(r"^/order/[^/]+$", path):
                 self._handle_get_order(path.split("/")[-1])
-            elif re.match(r"^/acme/order/[^/]+/finalize$", path):
+            elif re.match(r"^/order/[^/]+/finalize$", path):
                 order_id = path.split("/")[-2]
                 self._handle_finalize(order_id)
-            elif re.match(r"^/acme/authz/[^/]+$", path):
+            elif re.match(r"^/authz/[^/]+$", path):
                 self._handle_get_authz(path.split("/")[-1])
-            elif re.match(r"^/acme/challenge/[^/]+/[^/]+$", path):
+            elif re.match(r"^/challenge/[^/]+/[^/]+$", path):
                 parts = path.split("/")
                 self._handle_challenge(parts[-2], parts[-1])
-            elif re.match(r"^/acme/cert/[^/]+$", path):
+            elif re.match(r"^/cert/[^/]+$", path):
                 self._handle_get_cert(path.split("/")[-1])
-            elif path == "/acme/revoke-cert":
+            elif path == "/revoke-cert":
                 self._handle_revoke()
-            elif path == "/acme/key-change":
+            elif path == "/key-change":
                 self._handle_key_change()
             else:
                 self._send_error(404, "urn:ietf:params:acme:error:malformed", "Unknown endpoint")
@@ -865,17 +865,17 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_directory(self):
         directory = {
-            "newNonce":   f"{self.base_url}/acme/new-nonce",
-            "newAccount": f"{self.base_url}/acme/new-account",
-            "newOrder":   f"{self.base_url}/acme/new-order",
-            "revokeCert": f"{self.base_url}/acme/revoke-cert",
-            "keyChange":  f"{self.base_url}/acme/key-change",
+            "newNonce":   f"{self.base_url}/new-nonce",
+            "newAccount": f"{self.base_url}/new-account",
+            "newOrder":   f"{self.base_url}/new-order",
+            "revokeCert": f"{self.base_url}/revoke-cert",
+            "keyChange":  f"{self.base_url}/key-change",
             # renewalInfo stub (draft-ietf-acme-ari) — certbot ≥2.8 checks for this
             # field and gracefully ignores it when not a full URL; include it so
             # certbot does not log a warning about a missing field.
-            "renewalInfo": f"{self.base_url}/acme/renewal-info",
+            "renewalInfo": f"{self.base_url}/renewal-info",
             "meta": {
-                "termsOfService": f"{self.base_url}/acme/terms",
+                "termsOfService": f"{self.base_url}/terms",
                 "website":        f"{self.base_url}",
                 "caaIdentities":  [],
                 "externalAccountRequired": False,
@@ -914,7 +914,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
         tos_agreed = payload.get("termsOfServiceAgreed", False)
 
         is_new, account = self.db.create_or_find_account(jwk, contact)
-        kid_url = f"{self.base_url}/acme/account/{account['kid']}"
+        kid_url = f"{self.base_url}/account/{account['kid']}"
 
         # RFC 8555 §7.3: onlyReturnExisting — return 400 if account doesn't exist
         if payload.get("onlyReturnExisting") and is_new:
@@ -928,7 +928,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
         resp = {
             "status": account["status"],
             "contact": json.loads(account["contact"]) if account.get("contact") else [],
-            "orders": f"{self.base_url}/acme/account/{account['kid']}/orders",
+            "orders": f"{self.base_url}/account/{account['kid']}/orders",
         }
 
         # RFC 8555 §7.3: 201 Created for new accounts, 200 OK for existing
@@ -959,7 +959,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
                 return
 
         order = self.db.create_order(account["kid"], identifiers)
-        order_url = f"{self.base_url}/acme/order/{order['id']}"
+        order_url = f"{self.base_url}/order/{order['id']}"
 
         resp = self._order_response(order)
         self._send_json(resp, 201,
@@ -977,7 +977,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
 
         self._refresh_order_status(order_id)
         order = self.db.get_order(order_id)
-        order_url = f"{self.base_url}/acme/order/{order_id}"
+        order_url = f"{self.base_url}/order/{order_id}"
         # RFC 8555 §7.4 — finalize response MUST include Location: <order-url>
         # certbot polls this URL to detect when status transitions to "valid"
         self._send_json(self._order_response(order), 200, add_nonce=True,
@@ -985,16 +985,16 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
 
     def _order_response(self, order: dict) -> dict:
         auths = self.db.get_order_authorizations(order["id"])
-        auth_urls = [f"{self.base_url}/acme/authz/{a['id']}" for a in auths]
+        auth_urls = [f"{self.base_url}/authz/{a['id']}" for a in auths]
         resp = {
             "status": order["status"],
             "expires": self._ts(order["expires_at"]),
             "identifiers": json.loads(order["identifiers"]),
             "authorizations": auth_urls,
-            "finalize": f"{self.base_url}/acme/order/{order['id']}/finalize",
+            "finalize": f"{self.base_url}/order/{order['id']}/finalize",
         }
         if order.get("cert_id"):
-            resp["certificate"] = f"{self.base_url}/acme/cert/{order['cert_id']}"
+            resp["certificate"] = f"{self.base_url}/cert/{order['cert_id']}"
         return resp
 
     def _refresh_order_status(self, order_id: str):
@@ -1033,7 +1033,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
             key_auth = self.validator.key_authorization(c["token"], thumb)
             entry = {
                 "type":   c["type"],
-                "url":    f"{self.base_url}/acme/challenge/{authz['id']}/{c['id']}",
+                "url":    f"{self.base_url}/challenge/{authz['id']}/{c['id']}",
                 "token":  c["token"],
                 "status": c["status"],
             }
@@ -1076,7 +1076,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
 
         if chall["status"] != "pending":
             # Already processing or done — return current state
-            authz_url = f"{self.base_url}/acme/authz/{auth_id}"
+            authz_url = f"{self.base_url}/authz/{auth_id}"
             self._send_json(
                 self._challenge_response(chall, auth_id, account), 200,
                 add_nonce=True,
@@ -1147,7 +1147,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
     def _challenge_response(self, chall: dict, auth_id: str, account: dict) -> dict:
         resp = {
             "type":   chall["type"],
-            "url":    f"{self.base_url}/acme/challenge/{auth_id}/{chall['id']}",
+            "url":    f"{self.base_url}/challenge/{auth_id}/{chall['id']}",
             "token":  chall["token"],
             "status": chall["status"],
         }
@@ -1419,7 +1419,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
         resp = {
             "status":  account["status"],
             "contact": json.loads(account["contact"]) if account.get("contact") else [],
-            "orders":  f"{self.base_url}/acme/account/{kid}/orders",
+            "orders":  f"{self.base_url}/account/{kid}/orders",
         }
         self._send_json(resp, 200, add_nonce=True)
 
@@ -1539,7 +1539,7 @@ class ACMEHandler(http.server.BaseHTTPRequestHandler):
         # Always include a fresh nonce on errors so clients can retry immediately
         self.send_header("Replay-Nonce", self.db.create_nonce())
         # RFC 8555 §6.7 — Link: <directory>;rel="index" on all error responses
-        self.send_header("Link", f'<{self.base_url}/acme/directory>;rel="index"')
+        self.send_header("Link", f'<{self.base_url}/directory>;rel="index"')
         self.end_headers()
         self.wfile.write(body)
 
@@ -1577,8 +1577,8 @@ def make_acme_handler(
 
 
 def start_acme_server(
-    host: str,
-    port: int,
+    route_table,
+    prefix: str,
     ca,
     ca_dir: Path,
     auto_approve_dns: bool = False,
@@ -1587,12 +1587,17 @@ def start_acme_server(
     cert_validity_days: int = 90,
     short_lived_threshold_days: int = 7,
     dns01_hook=None,
-) -> ThreadedACMEServer:
+):
     """
-    Start the ACME server in a background thread.
-    Returns the server instance (call server.shutdown() to stop).
+    Register the ACME handler with *route_table* under *prefix*.
+
+    Returns a _RouteProxy whose .shutdown() unregisters the ACME routes.
 
     Args:
+        route_table: dispatcher_server.RouteTable shared by all services.
+        prefix: URL path prefix (e.g. "/acme").  The base_url passed to
+                ACME clients should include this prefix so that generated
+                URLs resolve correctly (e.g. "http://host:8080/acme").
         enable_tls_alpn01: If True, the tls-alpn-01 challenge type is offered
                            and validated. Requires the main server to advertise
                            "acme-tls/1" via ALPN (--alpn-acme flag).
@@ -1606,8 +1611,7 @@ def start_acme_server(
                     TXT lookup. Use make_dns01_webhook_hook() or
                     make_dns01_rfc2136_hook() from pki_server.py to build one.
     """
-    if base_url is None:
-        base_url = f"http://{host}:{port}"
+    from dispatcher_server import _RouteProxy
 
     db_path = str(ca_dir / "acme.db")
     db = ACMEDatabase(db_path)
@@ -1616,17 +1620,15 @@ def start_acme_server(
         tls_alpn01_enabled=enable_tls_alpn01,
         dns01_hook=dns01_hook,
     )
-    handler = make_acme_handler(
-        db, ca, validator, base_url,
+    handler_cls = make_acme_handler(
+        db, ca, validator, base_url or "",
         cert_validity_days=cert_validity_days,
         short_lived_threshold_days=short_lived_threshold_days,
     )
 
-    server = ThreadedACMEServer((host, port), handler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    logger.info(f"ACME server listening on {base_url}")
-    return server
+    route_table.register(prefix, handler_cls)
+    logger.info(f"ACME handler registered at prefix {prefix!r} (base_url={base_url!r})")
+    return _RouteProxy(route_table, prefix, label="acme")
 
 
 # ---------------------------------------------------------------------------
@@ -1685,17 +1687,17 @@ if __name__ == "__main__":
 ║  CA Dir     : {args.ca_dir:<51}║
 ║  DNS auto   : {"✓ (testing mode)" if args.auto_approve_dns else "✗ (real DNS validation)":<51}║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Directory  : GET  {base_url}/acme/directory         ║
-║  New Nonce  : HEAD {base_url}/acme/new-nonce         ║
-║  New Acct   : POST {base_url}/acme/new-account       ║
-║  New Order  : POST {base_url}/acme/new-order         ║
-║  Revoke     : POST {base_url}/acme/revoke-cert       ║
+║  Directory  : GET  {base_url}/directory              ║
+║  New Nonce  : HEAD {base_url}/new-nonce              ║
+║  New Acct   : POST {base_url}/new-account            ║
+║  New Order  : POST {base_url}/new-order              ║
+║  Revoke     : POST {base_url}/revoke-cert            ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Challenge types: http-01, dns-01, tls-alpn-01 (RFC 8737)      ║
 ╚══════════════════════════════════════════════════════════════════╝
 
   Quick test with curl:
-    curl {base_url}/acme/directory | python3 -m json.tool
+    curl {base_url}/directory | python3 -m json.tool
 """)
 
     try:

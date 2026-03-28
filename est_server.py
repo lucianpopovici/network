@@ -710,35 +710,28 @@ def _build_est_tls_context(
 
 
 def start_est_server(
-    host: str,
-    port: int,
+    route_table,
+    prefix: str,
     ca: "CertificateAuthority",
     ca_dir: Path,
     users: Optional[Dict[str, str]] = None,
     require_auth: bool = False,
+    # TLS parameters kept for API compatibility but are now handled by the
+    # dispatcher server; passing them here has no effect.
     tls_cert_path: Optional[str] = None,
     tls_key_path: Optional[str] = None,
     tls_reload_interval: int = 60,
-) -> http.server.HTTPServer:
+):
     """
-    Start the EST server in a background daemon thread.
+    Register the EST handler with the shared route table.
 
-    EST MUST run over TLS (RFC 7030 §3). We auto-issue a server TLS cert
-    from the CA if tls_cert_path/tls_key_path are not supplied.
+    TLS is now handled at the dispatcher level (start_dispatcher_server).
+    EST's RFC 7030 TLS requirement is satisfied when the dispatcher is
+    started with tls_mode="tls" or "mtls".
 
-    The server uses per-connection TLS wrapping (not socket-level wrapping)
-    so that the certificate can be reloaded without a restart — either
-    automatically (mtime watcher, every *tls_reload_interval* seconds) or
-    on demand via ``srv.reload_tls()``.
-
-    Parameters
-    ----------
-    tls_reload_interval : Seconds between cert-file mtime polls.  Set 0 to
-                          disable the automatic watcher.
-
-    Returns the HTTPServer so the caller can shut it down.
+    Returns a _RouteProxy whose .shutdown() unregisters the handler.
     """
-    from cmp_server import TLSContextHolder, TlsCertWatcher
+    from dispatcher_server import _RouteProxy
 
     user_store = ESTUserStore(users)
 
@@ -749,72 +742,9 @@ def start_est_server(
     BoundESTHandler.user_store = user_store
     BoundESTHandler.require_auth = require_auth
 
-    import http.server as _hs
-
-    # Resolve cert/key paths
-    if tls_cert_path and tls_key_path:
-        cert_path = tls_cert_path
-        key_path  = tls_key_path
-    else:
-        _cp, _kp  = ca.provision_tls_server_cert(host)
-        cert_path = str(_cp)
-        key_path  = str(_kp)
-
-    def _build_ctx(cp, kp):
-        return _build_est_tls_context(cp, kp, ca)
-
-    ctx    = _build_ctx(cert_path, key_path)
-    holder = TLSContextHolder(ctx)
-
-    # Per-connection TLS server — reads ctx_holder on every accept()
-    class _TLSThreadedServer(_hs.ThreadingHTTPServer):
-        allow_reuse_address = True
-        daemon_threads      = True
-        ctx_holder: TLSContextHolder = None
-
-        def get_request(self):
-            sock, addr = super().get_request()
-            try:
-                tls_sock = self.ctx_holder.get().wrap_socket(sock, server_side=True)
-                return tls_sock, addr
-            except ssl.SSLError as exc:
-                logger.warning("EST TLS handshake failed from %s: %s", addr, exc)
-                sock.close()
-                raise
-
-    srv = _TLSThreadedServer((host, port), BoundESTHandler)
-    srv.ctx_holder = holder
-
-    # Automatic cert-file watcher
-    if tls_reload_interval > 0:
-        watcher = TlsCertWatcher(
-            holder=holder,
-            cert_path=cert_path,
-            key_path=key_path,
-            build_ctx=_build_ctx,
-            poll_interval=tls_reload_interval,
-        ).start()
-        srv._tls_watcher = watcher
-    else:
-        srv._tls_watcher = None
-
-    def _reload_tls() -> bool:
-        if srv._tls_watcher:
-            return srv._tls_watcher.reload_now()
-        try:
-            holder.swap(_build_ctx(cert_path, key_path))
-            logger.info("EST TLS context reloaded via reload_tls()")
-            return True
-        except Exception as exc:
-            logger.error("EST TLS reload failed: %s", exc)
-            return False
-
-    srv.reload_tls = _reload_tls
-
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    logger.info(f"EST server listening on https://{host}:{port}/.well-known/est")
-    return srv
+    route_table.register(prefix, BoundESTHandler)
+    logger.info("EST handler registered at prefix %r", prefix)
+    return _RouteProxy(route_table, prefix, label="est")
 
 
 # ---------------------------------------------------------------------------

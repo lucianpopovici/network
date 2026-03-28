@@ -539,63 +539,63 @@ def _page(title: str, body: str, active: str = "") -> str:
 # Service definitions — shared between the page renderer and the API handler
 # ---------------------------------------------------------------------------
 
-# Each entry: (key, label, icon, rfc_label, description, default_port, fields)
+# Each entry: (key, label, icon, rfc_label, description, default_prefix, fields)
 # fields: list of (field_key, label, input_type, default_value, placeholder, extra_html_attrs)
 _SERVICE_DEFS = [
     (
         "cmp", "CMPv2/v3", "\U0001f510", "RFC 4210/9480",
         "Certificate Management Protocol for embedded devices and IoT",
-        8080,
+        "/cmp",
         [
-            ("port",     "Port",     "number", "8080", "8080",  'min="1" max="65535"'),
-            ("protocol", "Protocol", "select", "cmpv3", "",     ""),
+            ("prefix",   "Prefix",   "text",   "/cmp",  "/cmp",  ""),
+            ("protocol", "Protocol", "select", "cmpv3", "",      ""),
         ],
     ),
     (
         "acme", "ACME", "\U0001f916", "RFC 8555",
         "Automated Certificate Management for servers and workstations",
-        8888,
+        "/acme",
         [
-            ("port",      "Port",               "number", "8888", "8888", 'min="1" max="65535"'),
-            ("base_url",  "Public base URL",     "text",   "",     "http://hostname:8888", ""),
-            ("cert_days", "Cert validity (days)", "number","90",   "90",  'min="1" max="3650"'),
+            ("prefix",    "Prefix",              "text",   "/acme", "/acme", ""),
+            ("base_url",  "Public base URL",     "text",   "",      "http://hostname:8080/acme", ""),
+            ("cert_days", "Cert validity (days)", "number","90",    "90",   'min="1" max="3650"'),
         ],
     ),
     (
         "scep", "SCEP", "\U0001f310", "RFC 8894",
         "Simple Certificate Enrolment Protocol for network devices and MDM",
-        8889,
+        "/scep",
         [
-            ("port",      "Port",               "number", "8889", "8889", 'min="1" max="65535"'),
-            ("challenge", "Challenge password",  "text",   "",     "(leave blank = none)", ""),
+            ("prefix",    "Prefix",              "text",   "/scep", "/scep", ""),
+            ("challenge", "Challenge password",  "text",   "",      "(leave blank = none)", ""),
         ],
     ),
     (
         "est", "EST", "\U0001f512", "RFC 7030",
         "Enrollment over Secure Transport for TLS-capable devices",
-        8443,
+        "/est",
         [
-            ("port",         "Port",         "number", "8443", "8443", 'min="1" max="65535"'),
+            ("prefix",       "Prefix",       "text",   "/est", "/est", ""),
             ("require_auth", "Require auth", "select", "no",   "",     ""),
         ],
     ),
     (
         "ocsp", "OCSP", "\u2705", "RFC 6960",
         "Online Certificate Status Protocol revocation responder",
-        8082,
+        "/ocsp",
         [
-            ("port",          "Port",          "number", "8082", "8082", 'min="1" max="65535"'),
-            ("cache_seconds", "Cache TTL (s)", "number", "300",  "300",  'min="1"'),
+            ("prefix",        "Prefix",        "text",   "/ocsp", "/ocsp", ""),
+            ("cache_seconds", "Cache TTL (s)", "number", "300",   "300",   'min="1"'),
         ],
     ),
     (
         "ipsec", "IPsec PKI", "\U0001f6e1\ufe0f", "RFC 4945/4809",
         "VPN gateway and user certificate management",
-        8085,
+        "/ipsec",
         [
-            ("port",     "Port",     "number", "8085", "8085", 'min="1" max="65535"'),
-            ("ocsp_url", "OCSP URL", "text",   "",     "http://host:8082/ocsp", ""),
-            ("crl_url",  "CRL URL",  "text",   "",     "http://host:8080/ca/crl", ""),
+            ("prefix",   "Prefix",   "text",   "/ipsec", "/ipsec", ""),
+            ("ocsp_url", "OCSP URL", "text",   "",       "http://host:8080/ocsp", ""),
+            ("crl_url",  "CRL URL",  "text",   "",       "http://host:8080/ca/crl", ""),
         ],
     ),
 ]
@@ -665,6 +665,10 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
     ipsec_base_url: str = ""
     # Service registry dict — built in start_web_ui(), shared across instances
     service_registry: "Dict[str, Any]" = None
+    # RouteTable shared with the dispatcher — used by _launch_service()
+    route_table = None
+    # Base URL of the dispatcher server (e.g. "http://localhost:8080")
+    dispatcher_base_url: str = ""
 
     def log_message(self, fmt, *args):
         logger.debug("WebUI %s - %s", self.client_address[0], fmt % args)
@@ -1037,14 +1041,14 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
         reg = self.service_registry or {}
 
         cards = ""
-        for (name, label, icon, rfc, desc, default_port, fields) in _SERVICE_DEFS:
+        for (name, label, icon, rfc, desc, default_prefix, fields) in _SERVICE_DEFS:
             entry   = reg.get(name, {})
             running = entry.get("server") is not None
             avail   = entry.get("available", False)
             url     = entry.get("url", "")
             saved   = entry.get("config", {})
-            if not saved.get("port"):
-                saved["port"] = default_port
+            if not saved.get("prefix"):
+                saved["prefix"] = default_prefix
 
             # Status pill
             if running:
@@ -1690,64 +1694,66 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 
     def _launch_service(self, name: str, host: str, cfg: dict):
         """Start the named protocol service. Returns (server_object, url_string)."""
-        mods = (self.service_registry or {}).get("_modules", {})
-        port = int(cfg.get("port", 0))
-        if not port:
-            raise ValueError("port is required")
+        mods        = (self.service_registry or {}).get("_modules", {})
+        route_table = type(self).route_table
+        prefix      = cfg.get("prefix", "/{}".format(name))
 
         # Replace 0.0.0.0/empty with localhost so generated URLs are clickable in a browser
         display_host = "localhost" if host in ("0.0.0.0", "") else host
+        # Derive base URL from the dispatcher's address (stored on the class)
+        dispatcher_url = getattr(type(self), "dispatcher_base_url", "http://{}:8080".format(display_host))
 
         if name == "cmp":
             use_v3 = cfg.get("protocol", "cmpv3") != "cmpv2"
             srv    = mods["cmp"].start_cmp_server(
-                host=host, port=port, ca=self.ca, use_cmpv3=use_v3,
+                route_table=route_table, prefix=prefix, ca=self.ca, use_cmpv3=use_v3,
                 audit_log=self.audit_log,
                 rate_limiter=self.rate_limiter,
             )
-            url = "http://{}:{}".format(display_host, port)
+            url = "{}/{}".format(dispatcher_url.rstrip("/"), prefix.lstrip("/"))
 
         elif name == "acme":
-            base_url = cfg.get("base_url") or "http://{}:{}".format(display_host, port)
+            base_url = cfg.get("base_url") or "{}/{}".format(
+                dispatcher_url.rstrip("/"), prefix.lstrip("/"))
             srv = mods["acme"].start_acme_server(
-                host=host, port=port, ca=self.ca,
+                route_table=route_table, prefix=prefix, ca=self.ca,
                 ca_dir=self.ca.ca_dir,
                 auto_approve_dns=False,
                 base_url=base_url,
                 cert_validity_days=int(cfg.get("cert_days", 90)),
             )
-            url = base_url.rstrip("/") + "/acme/directory"
+            url = base_url.rstrip("/") + "/directory"
 
         elif name == "scep":
             srv = mods["scep"].start_scep_server(
-                host=host, port=port, ca=self.ca,
+                route_table=route_table, prefix=prefix, ca=self.ca,
                 ca_dir=self.ca.ca_dir,
                 challenge=cfg.get("challenge", ""),
             )
-            url = "http://{}:{}/scep".format(display_host, port)
+            url = "{}/{}".format(dispatcher_url.rstrip("/"), prefix.lstrip("/"))
 
         elif name == "est":
             srv = mods["est"].start_est_server(
-                host=host, port=port, ca=self.ca,
+                route_table=route_table, prefix=prefix, ca=self.ca,
                 ca_dir=self.ca.ca_dir,
                 require_auth=cfg.get("require_auth", "no") in ("yes", "true", True),
             )
-            url = "https://{}:{}/.well-known/est".format(display_host, port)
+            url = "{}/{}/.well-known/est".format(dispatcher_url.rstrip("/"), prefix.lstrip("/"))
 
         elif name == "ocsp":
             srv = mods["ocsp"].start_ocsp_server(
-                host=host, port=port, ca=self.ca,
+                route_table=route_table, prefix=prefix, ca=self.ca,
                 cache_seconds=int(cfg.get("cache_seconds", 300)),
             )
-            url = "http://{}:{}/ocsp".format(display_host, port)
+            url = "{}/{}".format(dispatcher_url.rstrip("/"), prefix.lstrip("/"))
 
         elif name == "ipsec":
             srv = mods["ipsec"].start_ipsec_server(
-                host=host, port=port, ca=self.ca,
+                route_table=route_table, prefix=prefix, ca=self.ca,
                 ocsp_url=cfg.get("ocsp_url", ""),
                 crl_url=cfg.get("crl_url", ""),
             )
-            url = "https://{}:{}/ipsec".format(display_host, port)
+            url = "{}/{}".format(dispatcher_url.rstrip("/"), prefix.lstrip("/"))
 
         else:
             raise ValueError("unknown service: {}".format(name))
@@ -1803,14 +1809,17 @@ class WebUIHandler(http.server.BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def start_web_ui(
-    host: str,
-    port: int,
+    route_table,
+    prefix: str,
     ca,
     audit_log=None,
     rate_limiter=None,
     # Authentication
     require_auth: bool = True,   # set False with --web-no-auth
     pam_service:  str  = "login",
+    # Base URL of the dispatcher (e.g. "http://localhost:8080") — used to
+    # build clickable URLs in the Services page when launching a sub-service.
+    dispatcher_base_url: str = "",
     # Currently-running base URLs (shown on dashboard)
     cmp_base_url:   str = "",
     acme_base_url:  str = "",
@@ -1834,12 +1843,10 @@ def start_web_ui(
     est_module=None,
     ocsp_module=None,
     ipsec_module=None,
-) -> http.server.HTTPServer:
+):
     """
-    Start the PyPKI web dashboard in a background daemon thread.
+    Register the Web UI handler with the shared route table.
 
-    New in this version
-    -------------------
     Pass the running server objects (*_server kwargs) so the Services page
     reflects which protocols are already active.
 
@@ -1847,32 +1854,37 @@ def start_web_ui(
     stopping services live from the dashboard, without restarting the process.
     If a module is None the service card shows "Not installed".
 
-    All existing callers continue to work unchanged (new kwargs default to None).
+    Returns a _RouteProxy whose .shutdown() unregisters the handler.
     """
+    from dispatcher_server import _RouteProxy
 
-    def _entry(srv_obj, mod, url: str, default_port: int, extra: dict = None):
-        cfg = {"port": default_port}
+    # bind_host is used by _launch_service — derive it from dispatcher_base_url
+    # or fall back to "0.0.0.0" as a sensible default.
+    bind_host = "0.0.0.0"
+
+    def _entry(srv_obj, mod, url: str, default_prefix: str, extra: dict = None):
+        cfg = {"prefix": default_prefix}
         if extra:
             cfg.update(extra)
         return {
             "server":    srv_obj,
             "available": mod is not None,
             "url":       url,
-            "bind_host": host,
+            "bind_host": bind_host,
             "config":    cfg,
         }
 
     service_registry: Dict[str, Any] = {
-        "cmp":   _entry(cmp_server,   cmp_module,   cmp_base_url,   8080),
-        "acme":  _entry(acme_server,  acme_module,  acme_base_url,  8888,
+        "cmp":   _entry(cmp_server,   cmp_module,   cmp_base_url,   "/cmp"),
+        "acme":  _entry(acme_server,  acme_module,  acme_base_url,  "/acme",
                         {"cert_days": 90}),
-        "scep":  _entry(scep_server,  scep_module,  scep_base_url,  8889,
+        "scep":  _entry(scep_server,  scep_module,  scep_base_url,  "/scep",
                         {"challenge": ""}),
-        "est":   _entry(est_server,   est_module,   est_base_url,   8443,
+        "est":   _entry(est_server,   est_module,   est_base_url,   "/est",
                         {"require_auth": "no"}),
-        "ocsp":  _entry(ocsp_server,  ocsp_module,  ocsp_base_url,  8082,
+        "ocsp":  _entry(ocsp_server,  ocsp_module,  ocsp_base_url,  "/ocsp",
                         {"cache_seconds": 300}),
-        "ipsec": _entry(ipsec_server, ipsec_module, ipsec_base_url, 8085,
+        "ipsec": _entry(ipsec_server, ipsec_module, ipsec_base_url, "/ipsec",
                         {"ocsp_url": "", "crl_url": ""}),
         # Private slot for module references (not rendered as a service card)
         "_modules": {
@@ -1892,25 +1904,21 @@ def start_web_ui(
     global _auth_enabled
     _auth_enabled = require_auth
 
-    BoundWebUIHandler.ca               = ca
-    BoundWebUIHandler.audit_log        = audit_log
-    BoundWebUIHandler.rate_limiter     = rate_limiter
-    BoundWebUIHandler.require_auth     = require_auth
-    BoundWebUIHandler.pam_service      = pam_service
-    BoundWebUIHandler.cmp_base_url     = cmp_base_url  or ""
-    BoundWebUIHandler.acme_base_url    = acme_base_url or ""
-    BoundWebUIHandler.scep_base_url    = scep_base_url or ""
-    BoundWebUIHandler.est_base_url     = est_base_url  or ""
-    BoundWebUIHandler.ocsp_base_url    = ocsp_base_url or ""
-    BoundWebUIHandler.ipsec_base_url   = ipsec_base_url or ""
-    BoundWebUIHandler.service_registry = service_registry
+    BoundWebUIHandler.ca                  = ca
+    BoundWebUIHandler.audit_log           = audit_log
+    BoundWebUIHandler.rate_limiter        = rate_limiter
+    BoundWebUIHandler.require_auth        = require_auth
+    BoundWebUIHandler.pam_service         = pam_service
+    BoundWebUIHandler.cmp_base_url        = cmp_base_url   or ""
+    BoundWebUIHandler.acme_base_url       = acme_base_url  or ""
+    BoundWebUIHandler.scep_base_url       = scep_base_url  or ""
+    BoundWebUIHandler.est_base_url        = est_base_url   or ""
+    BoundWebUIHandler.ocsp_base_url       = ocsp_base_url  or ""
+    BoundWebUIHandler.ipsec_base_url      = ipsec_base_url or ""
+    BoundWebUIHandler.service_registry    = service_registry
+    BoundWebUIHandler.route_table         = route_table
+    BoundWebUIHandler.dispatcher_base_url = dispatcher_base_url or ""
 
-    class _ThreadedServer(http.server.ThreadingHTTPServer):
-        allow_reuse_address = True
-        daemon_threads      = True
-
-    srv = _ThreadedServer((host, port), BoundWebUIHandler)
-    t   = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    logger.info("Web UI listening on http://%s:%s", host, port)
-    return srv
+    route_table.register(prefix, BoundWebUIHandler)
+    logger.info("Web UI handler registered at prefix %r", prefix)
+    return _RouteProxy(route_table, prefix, label="web_ui")

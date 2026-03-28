@@ -1872,42 +1872,41 @@ def start_bootstrap_server(host: str, port: int, ca: CertificateAuthority, cmp_h
 # ---------------------------------------------------------------------------
 
 def start_cmp_server(
-    host: str,
-    port: int,
+    route_table,
+    prefix: str,
     ca: "CertificateAuthority",
     audit_log: Optional["AuditLog"] = None,
     rate_limiter: Optional["RateLimiter"] = None,
     use_cmpv3: bool = True,
+    bootstrap_port: Optional[int] = None,
+    # TLS parameters kept for API compatibility but are now handled by the
+    # dispatcher server; passing them here has no effect.
     tls_cert_path: Optional[str] = None,
     tls_key_path: Optional[str] = None,
     require_client_cert: bool = False,
     tls13_only: bool = False,
     alpn_protocols: Optional[List[str]] = None,
-    bootstrap_port: Optional[int] = None,
     tls_reload_interval: int = 60,
 ):
     """
-    Start the CMP server in a background thread and return the server object.
+    Register the CMP handler with *route_table* under *prefix*.
+
+    Returns a _RouteProxy whose .shutdown() unregisters the CMP routes.
 
     Parameters
     ----------
-    host, port           : bind address and port
-    ca                   : CertificateAuthority instance
-    audit_log            : optional AuditLog
-    rate_limiter         : optional RateLimiter
-    use_cmpv3            : True  → CMPv3Handler (RFC 9480, default)
-                           False → CMPv2Handler only
-    tls_cert_path /
-    tls_key_path         : PEM cert+key for HTTPS; None → plain HTTP
-    require_client_cert  : True → mutual TLS (client cert required)
-    tls13_only           : restrict to TLS 1.3
-    alpn_protocols       : ALPN list (default: ["http/1.1"])
-    bootstrap_port       : if set, also start a plain-HTTP bootstrap server
-    tls_reload_interval  : seconds between cert-file mtime checks for
-                           automatic zero-downtime reload (default: 60).
-                           Set 0 to disable the watcher (use POST /api/reload-tls
-                           from a certbot deploy-hook instead).
+    route_table  : dispatcher_server.RouteTable shared by all services
+    prefix       : URL path prefix (e.g. "/cmp")
+    ca           : CertificateAuthority instance
+    audit_log    : optional AuditLog
+    rate_limiter : optional RateLimiter
+    use_cmpv3    : True  → CMPv3Handler (RFC 9480, default)
+                   False → CMPv2Handler only
+    bootstrap_port : if set, also start a plain-HTTP bootstrap server on
+                     this port (separate from the main dispatcher)
     """
+    from dispatcher_server import _RouteProxy
+
     if use_cmpv3:
         cmp_handler = CMPv3Handler(ca)
         handler_cls = make_cmpv3_handler(ca, cmp_handler, audit_log, rate_limiter)
@@ -1915,66 +1914,17 @@ def start_cmp_server(
         cmp_handler = CMPv2Handler(ca)
         handler_cls = make_handler(ca, cmp_handler, audit_log, rate_limiter)
 
-    if tls_cert_path and tls_key_path:
-        def _build_ctx(cert_path, key_path):
-            return ca.build_tls_context(
-                cert_path=cert_path,
-                key_path=key_path,
-                require_client_cert=require_client_cert,
-                alpn_protocols=alpn_protocols or [CertificateAuthority.ALPN_HTTP1],
-                tls13_only=tls13_only,
-            )
-
-        ssl_ctx = _build_ctx(tls_cert_path, tls_key_path)
-        holder  = TLSContextHolder(ssl_ctx)
-
-        srv = TLSServer((host, port), handler_cls)
-        srv.ctx_holder = holder
-
-        # Attach watcher for automatic zero-downtime reload when cert file changes
-        if tls_reload_interval > 0:
-            watcher = TlsCertWatcher(
-                holder=holder,
-                cert_path=tls_cert_path,
-                key_path=tls_key_path,
-                build_ctx=_build_ctx,
-                poll_interval=tls_reload_interval,
-            ).start()
-            srv._tls_watcher = watcher      # kept alive + stoppable via srv
-        else:
-            srv._tls_watcher = None
-
-        # Expose a reload_tls() convenience method on the server object so the
-        # POST /api/reload-tls handler (and certbot deploy-hooks) can call it.
-        def _reload_tls() -> bool:
-            if srv._tls_watcher:
-                return srv._tls_watcher.reload_now()
-            # No watcher — rebuild manually
-            try:
-                new_ctx = _build_ctx(tls_cert_path, tls_key_path)
-                holder.swap(new_ctx)
-                logger.info("CMP TLS context reloaded via reload_tls()")
-                return True
-            except Exception as exc:
-                logger.error("CMP TLS reload failed: %s", exc)
-                return False
-
-        srv.reload_tls = _reload_tls
-        scheme = "https"
-    else:
-        srv = ThreadedHTTPServer((host, port), handler_cls)
-        srv._tls_watcher = None
-        srv.reload_tls   = lambda: False
-        scheme = "http"
-
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    logger.info("CMP server listening on %s://%s:%s", scheme, host, port)
+    route_table.register(prefix, handler_cls)
+    logger.info("CMP handler registered at prefix %r", prefix)
 
     if bootstrap_port:
-        start_bootstrap_server(host, bootstrap_port, ca, cmp_handler)
+        # Bootstrap server still runs on its own port (plain HTTP, no prefix)
+        start_bootstrap_server("0.0.0.0", bootstrap_port, ca, cmp_handler)
 
-    return srv
+    proxy = _RouteProxy(route_table, prefix, label="cmp")
+    # Expose reload_tls() shim for callers that used it on the old server object
+    proxy.reload_tls = lambda: False
+    return proxy
 
 
 # ---------------------------------------------------------------------------

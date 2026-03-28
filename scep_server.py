@@ -778,7 +778,7 @@ class SCEPHandler(http.server.BaseHTTPRequestHandler):
             operation = params.get("operation", "")
             message = params.get("message", "")
 
-            if path not in ("/scep", "/cgi-bin/pkiclient.exe", "/scep/pkiclient.exe"):
+            if path not in ("/", "/pkiclient.exe", "/cgi-bin/pkiclient.exe"):
                 self._send_error_plain(404, "Not found")
                 return
 
@@ -1319,17 +1319,20 @@ def hmac_compare(a: bytes, b: bytes) -> bool:
 # ---------------------------------------------------------------------------
 
 def start_scep_server(
-    host: str,
-    port: int,
+    route_table,
+    prefix: str,
     ca: "CertificateAuthority",
     ca_dir: Path,
     challenge: str = "",
     auto_issue: bool = True,
-) -> http.server.HTTPServer:
+):
     """
-    Start the SCEP server in a background thread.
-    Returns the HTTPServer instance so the caller can shut it down.
+    Register the SCEP handler with *route_table* under *prefix*.
+
+    Returns a _RouteProxy whose .shutdown() unregisters the SCEP routes.
     """
+    from dispatcher_server import _RouteProxy
+
     db_path = str(ca_dir / "scep.db")
     db = SCEPDatabase(db_path)
 
@@ -1341,16 +1344,9 @@ def start_scep_server(
     BoundSCEPHandler.challenge = challenge
     BoundSCEPHandler.auto_issue = auto_issue
 
-    import http.server as _hs
-    class _ThreadedServer(_hs.ThreadingHTTPServer):
-        allow_reuse_address = True
-        daemon_threads = True
-
-    srv = _ThreadedServer((host, port), BoundSCEPHandler)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    logger.info(f"SCEP server listening on http://{host}:{port}/scep")
-    return srv
+    route_table.register(prefix, BoundSCEPHandler)
+    logger.info(f"SCEP handler registered at prefix {prefix!r}")
+    return _RouteProxy(route_table, prefix, label="scep")
 
 
 def main():
